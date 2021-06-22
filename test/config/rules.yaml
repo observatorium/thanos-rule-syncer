@@ -1,0 +1,6 @@
+groups:
+  - name: test-oidc
+    interval: 5s
+    rules:
+      - record: trs
+        expr: vector(1)

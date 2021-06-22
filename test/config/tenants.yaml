@@ -4,3 +4,4 @@ tenants:
   oidc:
     clientID: observatorium
     issuerURL: http://localhost:4444/
+  ruleFilePath: ./test/config/rules.yaml
