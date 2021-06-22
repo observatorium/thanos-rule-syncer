@@ -1,7 +1,9 @@
 #!/bin/bash
 
-# Runs a semi-realistic integration test with a producer generating metrics
-# all being authenticated via Hydra and authorized with opa-ams.
+# Runs a semi-realistic integration test with an Observatorium API
+# exposing rules using a file as the rule repository, a thanos-rule-syncer
+# configuring a Thanos Ruler, and a Thanos Querier evaluating the rules
+# all being authenticated via Hydra.
 
 set -euo pipefail
 
@@ -26,8 +28,25 @@ echo "-------------------------------------------"
 curl \
     --header "Content-Type: application/json" \
     --request POST \
-    --data '{"audience": ["observatorium"], "client_id": "up", "client_secret": "secret", "grant_types": ["client_credentials"], "token_endpoint_auth_method": "client_secret_basic"}' \
+    --data '{"audience": ["observatorium"], "client_id": "read-only", "client_secret": "secret", "grant_types": ["client_credentials"], "token_endpoint_auth_method": "client_secret_post"}' \
     http://127.0.0.1:4445/clients
+
+curl \
+    --header "Content-Type: application/json" \
+    --request POST \
+    --data '{"audience": ["observatorium"], "client_id": "thanos-rule-syncer", "client_secret": "secret", "grant_types": ["client_credentials"], "token_endpoint_auth_method": "client_secret_basic"}' \
+    http://127.0.0.1:4445/clients
+
+token=$(curl \
+    --request POST \
+    --silent \
+    --url http://127.0.0.1:4444/oauth2/token \
+    --header 'content-type: application/x-www-form-urlencoded' \
+    --data grant_type=client_credentials \
+    --data client_id=read-only \
+    --data client_secret=secret \
+    --data audience=observatorium \
+    --data scope="openid" | sed 's/^{.*"access_token":[^"]*"\([^"]*\)".*}/\1/')
 
 (
  observatorium \
@@ -41,26 +60,26 @@ curl \
    --log.level=debug
 ) &
 
-#(
-#  thanos receive \
-#    --receive.hashrings-file=./test/config/hashrings.json \
-#    --receive.local-endpoint=127.0.0.1:10901 \
-#    --receive.default-tenant-id="1610b0c3-c509-4592-a256-a1871353dbfa" \
-#    --grpc-address=127.0.0.1:10901 \
-#    --http-address=127.0.0.1:10902 \
-#    --remote-write.address=127.0.0.1:19291 \
-#    --log.level=error \
-#    --tsdb.path="$(mktemp -d)"
-#) &
-#
-#(
-#  thanos query \
-#    --grpc-address=127.0.0.1:10911 \
-#    --http-address=127.0.0.1:9091 \
-#    --store=127.0.0.1:10901 \
-#    --log.level=error \
-#    --web.external-prefix=.
-#) &
+tmp=$(mktemp -d)
+touch "$tmp"/rules.yaml
+
+(
+  thanos rule \
+    --query=127.0.0.1:9091 \
+    --rule-file="$tmp"/rules.yaml \
+    --grpc-address=127.0.0.1:10901 \
+    --http-address=127.0.0.1:10902 \
+    --log.level=error \
+    --data-dir="$tmp"
+) &
+
+(
+  thanos query \
+    --grpc-address=127.0.0.1:10911 \
+    --http-address=127.0.0.1:9091 \
+    --store=127.0.0.1:10901 \
+    --log.level=error
+) &
 
 
 echo "-------------------------------------------"
@@ -69,82 +88,44 @@ echo "-------------------------------------------"
 
 (
   ./thanos-rule-syncer \
-      --observatorium-api-url=http://localhost:8443/api/metrics/v1/test-oidc/rules \
-      --thanos-rule-url=http://localhost:10902 \
-      --file=/tmp/thanos-rule-test.yaml
-     --oidc.issuer-url=http://localhost:4444/ \
-     --oidc.client-id=up \
-     --oidc.client-secret=secret \
-     --oidc.audience=observatorium
+    --interval=2 \
+    --observatorium-api-url=http://localhost:8443/api/metrics/v1/test-oidc/rules \
+    --thanos-rule-url=http://localhost:10902 \
+    --file="$tmp"/rules.yaml \
+    --oidc.issuer-url=http://localhost:4444/ \
+    --oidc.client-id=thanos-rule-syncer \
+    --oidc.client-secret=secret \
+    --oidc.audience=observatorium
 ) &
-
-exit 0
 
 echo "-------------------------------------------"
 echo "- Waiting for dependencies to come up...  -"
 echo "-------------------------------------------"
 sleep 10
 
-until curl --output /dev/null --silent --fail http://127.0.0.1:8081/ready; do
+until curl --output /dev/null --silent --fail http://127.0.0.1:8448/ready; do
   printf '.'
   sleep 1
 done
 
 echo "-------------------------------------------"
-echo "- Token File                              -"
+echo "- Rules File tests                        -"
 echo "-------------------------------------------"
 
-if up \
-  --listen=0.0.0.0:8888 \
-  --endpoint-type=metrics \
-  --endpoint-read=http://127.0.0.1:8443/api/metrics/v1/test-oidc/api/v1/query \
-  --endpoint-write=http://127.0.0.1:8443/api/metrics/v1/test-oidc/api/v1/receive \
-  --period=500ms \
-  --initial-query-delay=250ms \
-  --threshold=1 \
-  --latency=10s \
-  --duration=10s \
-  --log.level=error \
-  --name=observatorium_write \
-  --labels='_id="test"' \
-  --token-file=./tmp/token; then
+query="$(curl \
+    --fail \
+    'http://127.0.0.1:8443/api/metrics/v1/test-oidc/api/v1/query?query=trs' \
+    -H "Authorization: bearer $token")"
+
+if [[ "$query" == *'"result":[{"metric":{"__name__":"trs","tenant_id":"1610b0c3-c509-4592-a256-a1871353dbfa"}'* ]]; then
   result=0
   echo "-------------------------------------------"
-  echo "- Token File: OK                          -"
+  echo "- Rules File: OK                          -"
   echo "-------------------------------------------"
 else
   result=1
   echo "-------------------------------------------"
-  echo "- Token File: FAILED                      -"
-  echo "-------------------------------------------"
-  exit 1
-fi
-
-echo "-------------------------------------------"
-echo "- Token Proxy                             -"
-echo "-------------------------------------------"
-
-if up \
-  --listen=0.0.0.0:8888 \
-  --endpoint-type=metrics \
-  --endpoint-read=http://127.0.0.1:8080/api/metrics/v1/test-oidc/api/v1/query \
-  --endpoint-write=http://127.0.0.1:8080/api/metrics/v1/test-oidc/api/v1/receive \
-  --period=500ms \
-  --initial-query-delay=250ms \
-  --threshold=1 \
-  --latency=10s \
-  --duration=10s \
-  --log.level=error \
-  --name=observatorium_write \
-  --labels='_id="test"'; then
-  result=0
-  echo "-------------------------------------------"
-  echo "- Token Proxy: OK                         -"
-  echo "-------------------------------------------"
-else
-  result=1
-  echo "-------------------------------------------"
-  echo "- Token Proxy: FAILED                     -"
+  echo "- Rules File: FAILED                      -"
   echo "-------------------------------------------"
   exit 1
 fi

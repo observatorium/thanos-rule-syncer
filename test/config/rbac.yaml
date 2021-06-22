@@ -1,16 +1,17 @@
 roles:
-- name: read-write
+- name: read
   resources:
   - metrics
   tenants:
   - test-oidc
   permissions:
   - read
-  - write
 roleBindings:
 - name: test
   roles:
-  - read-write
+  - read
   subjects:
-  - name: up
+  - name: read-only
+    kind: user
+  - name: thanos-rule-syncer
     kind: user
