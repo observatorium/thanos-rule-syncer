@@ -22,9 +22,11 @@ import (
 
 type config struct {
 	observatoriumURL string
+	observatoriumCA  string
 	thanosRuleURL    string
 	file             string
 	oidc             oidcConfig
+	interval         uint
 }
 
 type oidcConfig struct {
@@ -37,12 +39,14 @@ type oidcConfig struct {
 func parseFlags() *config {
 	cfg := &config{}
 	flag.StringVar(&cfg.observatoriumURL, "observatorium-api-url", "", "The URL of the Observatorium API from where to fetch the rules. This should be the full ULR including the path to the tenant's rules.")
+	flag.StringVar(&cfg.observatoriumCA, "observatorium-ca", "", "Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.")
 	flag.StringVar(&cfg.thanosRuleURL, "thanos-rule-url", "", "The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload.")
 	flag.StringVar(&cfg.file, "file", "", "The path to the file the rules are written to on disk so that Thanos Ruler can read it from.")
 	flag.StringVar(&cfg.oidc.issuerURL, "oidc.issuer-url", "", "The OIDC issuer URL, see https://openid.net/specs/openid-connect-discovery-1_0.html#IssuerDiscovery.")
 	flag.StringVar(&cfg.oidc.clientSecret, "oidc.client-secret", "", "The OIDC client secret, see https://tools.ietf.org/html/rfc6749#section-2.3.")
 	flag.StringVar(&cfg.oidc.clientID, "oidc.client-id", "", "The OIDC client ID, see https://tools.ietf.org/html/rfc6749#section-2.3.")
 	flag.StringVar(&cfg.oidc.audience, "oidc.audience", "", "The audience for whom the access token is intended, see https://openid.net/specs/openid-connect-core-1_0.html#IDToken.")
+	flag.UintVar(&cfg.interval, "interval", 60, "The interval at which to poll the Observatorium API for updates to rules, given in seconds.")
 
 	flag.Parse()
 	return cfg
@@ -55,6 +59,20 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &http.Client{}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+
+	if cfg.observatoriumCA != "" {
+		caFile, err := ioutil.ReadFile(cfg.observatoriumCA)
+		if err != nil {
+			log.Fatalf("failed to read Observatorium CA file: %v", err)
+		}
+
+		certPool := x509.NewCertPool()
+		certPool.AppendCertsFromPEM(caFile)
+		t.TLSClientConfig = &tls.Config{
+			RootCAs: certPool,
+		}
+	}
 
 	if cfg.oidc.issuerURL != "" {
 		provider, err := oidc.NewProvider(context.Background(), cfg.oidc.issuerURL)
@@ -74,33 +92,20 @@ func main() {
 				"audience": []string{cfg.oidc.audience},
 			}
 		}
-
-		caFile, err := ioutil.ReadFile("../observatorium/tmp/certs/ca.pem")
-		if err != nil {
-			log.Fatalf("failed to read CA file: %v", err)
+		client = &http.Client{
+			Transport: &oauth2.Transport{
+				Base:   t,
+				Source: ccc.TokenSource(ctx),
+			},
 		}
 
-		certPool := x509.NewCertPool()
-		certPool.AppendCertsFromPEM(caFile)
-
-		clientCert, err := tls.LoadX509KeyPair("../observatorium/tmp/certs/client.pem", "../observatorium/tmp/certs/client.key")
-		if err != nil {
-			log.Fatalf("failed to load client key pair: %v", err)
-		}
-
-		tlsConfig := tls.Config{
-			RootCAs:      certPool,
-			Certificates: []tls.Certificate{clientCert},
-		}
-
-		client.Transport = &http.Transport{TLSClientConfig: &tlsConfig}
 	}
 
 	var gr run.Group
 	gr.Add(run.SignalHandler(ctx, os.Interrupt))
 
 	gr.Add(func() error {
-		ticker := time.NewTicker(time.Minute)
+		ticker := time.NewTicker(time.Duration(cfg.interval) * time.Second)
 		for {
 			select {
 			case <-ticker.C:
@@ -138,8 +143,6 @@ func main() {
 	if err := gr.Run(); err != nil {
 		log.Fatalf("thanos-rule-syncer quit unexpectectly: %v", err)
 	}
-
-	fmt.Println("success")
 }
 
 func getRules(ctx context.Context, client *http.Client, url string) ([]byte, error) {
