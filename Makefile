@@ -16,19 +16,17 @@ DOCKER_REPO ?= quay.io/observatorium/thanos-rule-syncer
 THANOS ?= $(BIN_DIR)/thanos
 THANOS_VERSION ?= 0.17.0
 OBSERVATORIUM ?= $(BIN_DIR)/observatorium
-UP ?= $(BIN_DIR)/up
 HYDRA ?= $(BIN_DIR)/hydra
 GOLANGCILINT ?= $(FIRST_GOPATH)/bin/golangci-lint
 GOLANGCILINT_VERSION ?= v1.21.0
 EMBEDMD ?= $(BIN_DIR)/embedmd
 SHELLCHECK ?= $(BIN_DIR)/shellcheck
-MEMCACHED ?= $(BIN_DIR)/memcached
 
 default: thanos-rule-syncer
 all: clean lint test thanos-rule-syncer
 
 tmp/help.txt: thanos-rule-syncer
-	./thanos-rule-syncer --help 2>&1 | head -n -1 > tmp/help.txt || true
+	./thanos-rule-syncer --help &> tmp/help.txt || true
 
 README.md: $(EMBEDMD) tmp/help.txt
 	$(EMBEDMD) -w README.md
@@ -101,7 +99,7 @@ container-release: container
 	docker push $(DOCKER_REPO):latest
 
 .PHONY: integration-test-dependencies
-integration-test-dependencies: $(THANOS) $(HYDRA)
+integration-test-dependencies: $(THANOS) $(HYDRA) $(OBSERVATORIUM)
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -114,10 +112,7 @@ $(THANOS): | $(BIN_DIR)
 	curl -L "https://github.com/thanos-io/thanos/releases/download/v$(THANOS_VERSION)/thanos-$(THANOS_VERSION).$$(go env GOOS)-$$(go env GOARCH).tar.gz" | tar --strip-components=1 -xzf - -C $(BIN_DIR)
 
 $(OBSERVATORIUM): | vendor $(BIN_DIR)
-	go build -mod=vendor -o $@ github.com/observatorium/observatorium
-
-$(UP): | vendor $(BIN_DIR)
-	go build -mod=vendor -o $@ github.com/observatorium/up/cmd/up
+	go build -mod=vendor -o $@ github.com/observatorium/api
 
 $(HYDRA): | vendor $(BIN_DIR)
 	@echo "Downloading Hydra"
