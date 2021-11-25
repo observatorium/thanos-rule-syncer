@@ -1,284 +1,129 @@
 package v1
 
 import (
-	"context"
-	"errors"
-	"html/template"
+	"io"
 	"io/ioutil"
 	"net/http"
-	"os"
 
-	"github.com/go-chi/chi"
+	"github.com/ghodss/yaml"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/rulefmt"
-	"gopkg.in/yaml.v3"
-
 	"github.com/observatorium/api/authentication"
+	"github.com/observatorium/api/rules"
 )
 
-// ErrRuleNotFound is returned when a particular rule wasn't found by its name.
-var ErrRuleNotFound = errors.New("rule not found")
-
-type RuleGroups struct {
-	Groups []RuleGroup `yaml:"groups"`
+type rulesHandler struct {
+	client      rules.ClientInterface
+	logger      log.Logger
+	tenantLabel string
 }
 
-type RuleGroup struct {
-	Name     string         `yaml:"name"`
-	Interval model.Duration `yaml:"interval"`
-	Rules    []rulefmt.Rule `yaml:"rules"`
-}
-
-// RulesRepository describes all of the operations that a conformant repository should implement.
-type RulesRepository interface {
-	RulesLister
-	RulesGetter
-	RulesWriter
-}
-
-type RulesLister interface {
-	ListRuleGroups(ctx context.Context, tenant string) (RuleGroups, error)
-}
-
-func listRulesHandler(logger log.Logger, lister RulesLister, label string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tenant, ok := authentication.GetTenant(r.Context())
-		if !ok {
-			http.Error(w, "failed to get tenant", http.StatusInternalServerError)
-			return
-		}
-
-		id, ok := authentication.GetTenantID(r.Context())
-		if !ok {
-			const msg = "error finding tenant ID"
-			level.Warn(logger).Log("msg", msg)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		rules, err := lister.ListRuleGroups(r.Context(), tenant)
-		if err != nil {
-			msg := "failed to list rules"
-			level.Debug(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		for i := range rules.Groups {
-			for j := range rules.Groups[i].Rules {
-				if rules.Groups[i].Rules[j].Labels == nil {
-					rules.Groups[i].Rules[j].Labels = make(map[string]string)
-				}
-				rules.Groups[i].Rules[j].Labels[label] = id
-			}
-		}
-
-		bytes, err := yaml.Marshal(rules)
-		if err != nil {
-			msg := "failed to marshal rules"
-			level.Debug(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		_, _ = w.Write(bytes)
+func (rh *rulesHandler) get(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := authentication.GetTenant(r.Context())
+	if !ok {
+		http.Error(w, "error finding tenant", http.StatusUnauthorized)
+		return
 	}
-}
 
-type RulesGetter interface {
-	GetRules(ctx context.Context, tenant, name string) (RuleGroup, error)
-}
-
-func getRuleHandler(logger log.Logger, repository RulesGetter, label string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tenant, ok := authentication.GetTenant(r.Context())
-		if !ok {
-			http.Error(w, "failed to get tenant", http.StatusInternalServerError)
-			return
-		}
-
-		id, ok := authentication.GetTenantID(r.Context())
-		if !ok {
-			const msg = "error finding tenant ID"
-			level.Warn(logger).Log("msg", msg)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		name := chi.URLParam(r, "name")
-
-		rules, err := repository.GetRules(r.Context(), tenant, name)
-		if err == ErrRuleNotFound {
-			msg := "rule not found"
-			level.Debug(logger).Log("msg", msg)
-			http.Error(w, msg, http.StatusNotFound)
-			return
-		}
-		if err != nil {
-			msg := "failed to get rules"
-			level.Warn(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		for i := range rules.Rules {
-			if rules.Rules[i].Labels == nil {
-				rules.Rules[i].Labels = make(map[string]string)
-			}
-			rules.Rules[i].Labels[label] = id
-		}
-
-		bytes, err := yaml.Marshal(rules)
-		if err != nil {
-			msg := "failed to marshal rules"
-			level.Warn(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		_, _ = w.Write(bytes)
+	id, ok := authentication.GetTenantID(r.Context())
+	if !ok {
+		http.Error(w, "error finding tenant ID", http.StatusUnauthorized)
+		return
 	}
-}
 
-const editHTML = `
-<html lang="en">
-<head>
-    <title>Edit Rules - Observatorium</title>
-</head>
-<body>
-    <h3>Edit Rule {{ .Name }}</h3>
-    <form action="/api/metrics/v1/{{ .Tenant }}/rules/{{ .Name }}" method="post">
-        <textarea cols="120" rows="30" name="rulegroup">{{ .Rules }}</textarea><br>
-        <button type="submit">Update</button>
-    </form>
-</body>
-</html>
-`
-
-func editRuleHandler(logger log.Logger, repository RulesGetter) http.HandlerFunc {
-	tmpl, err := template.New("edit").Parse(editHTML)
+	resp, err := rh.client.ListRules(r.Context(), tenant)
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to parse rule edit HTML", "err", err)
-		os.Exit(1)
+		level.Error(rh.logger).Log("msg", "could not list rules", "err", err.Error())
+
+		sc := http.StatusInternalServerError
+		if resp != nil {
+			sc = resp.StatusCode
+		}
+
+		http.Error(w, "error listing rules", sc)
+
+		return
 	}
 
-	return func(w http.ResponseWriter, r *http.Request) {
-		tenant, ok := authentication.GetTenant(r.Context())
-		if !ok {
-			http.Error(w, "failed to get tenant", http.StatusInternalServerError)
-			return
-		}
-		name := chi.URLParam(r, "name")
+	defer resp.Body.Close()
 
-		rules, err := repository.GetRules(r.Context(), tenant, name)
-		if err == ErrRuleNotFound {
-			const msg = "rule not found"
-			level.Debug(logger).Log("msg", msg)
-			http.Error(w, msg, http.StatusNotFound)
-			return
-		}
-		if err != nil {
-			const msg = "failed to get rules"
-			level.Warn(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
+	if resp.StatusCode/100 != 2 {
+		http.Error(w, "error listing rules", resp.StatusCode)
+		return
+	}
 
-		bytes, err := yaml.Marshal(rules)
-		if err != nil {
-			const msg = "failed to marshal rules"
-			level.Warn(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "error listing rules", http.StatusInternalServerError)
+		return
+	}
 
-		_ = tmpl.Execute(w, struct {
-			Name   string
-			Rules  string
-			Tenant string
-		}{
-			Name:   name,
-			Rules:  string(bytes),
-			Tenant: tenant,
-		})
+	var rawRules rules.Rules
+	if err := yaml.Unmarshal(body, &rawRules); err != nil {
+		level.Error(rh.logger).Log("msg", "could not unmarshal rules", "err", err.Error())
+		http.Error(w, "error unmarshaling rules", http.StatusInternalServerError)
+
+		return
+	}
+
+	for i := range rawRules.Groups {
+		for j := range rawRules.Groups[i].Rules {
+			switch r := rawRules.Groups[i].Rules[j].(type) {
+			case rules.RecordingRule:
+				if r.Labels.AdditionalProperties == nil {
+					r.Labels.AdditionalProperties = make(map[string]string)
+				}
+
+				r.Labels.AdditionalProperties[rh.tenantLabel] = id
+				rawRules.Groups[i].Rules[j] = r
+			case rules.AlertingRule:
+				if r.Labels.AdditionalProperties == nil {
+					r.Labels.AdditionalProperties = make(map[string]string)
+				}
+
+				r.Labels.AdditionalProperties[rh.tenantLabel] = id
+				rawRules.Groups[i].Rules[j] = r
+			}
+		}
+	}
+
+	body, err = yaml.Marshal(rawRules)
+	if err != nil {
+		level.Error(rh.logger).Log("msg", "could not marshal YAML", "err", err.Error())
+		http.Error(w, "error marshaling YAML", http.StatusInternalServerError)
+
+		return
+	}
+
+	if _, err := w.Write(body); err != nil {
+		level.Error(rh.logger).Log("msg", "could not write body", "err", err.Error())
+		return
 	}
 }
 
-type RulesWriter interface {
-	CreateRule(ctx context.Context, tenant, name string, interval int64, rules []byte) error
-	UpdateRule(ctx context.Context, tenant, name string, interval int64, rules []byte) error
-}
+func (rh *rulesHandler) put(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := authentication.GetTenant(r.Context())
+	if !ok {
+		http.Error(w, "error finding tenant", http.StatusUnauthorized)
+	}
 
-func writeRuleHandler(logger log.Logger, repository RulesWriter, label string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tenant, ok := authentication.GetTenant(r.Context())
-		if !ok {
-			const msg = "failed to get tenant"
-			level.Warn(logger).Log("msg", msg)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
+	resp, err := rh.client.SetRulesWithBody(r.Context(), tenant, r.Header.Get("Content-type"), r.Body)
+	if err != nil {
+		sc := http.StatusInternalServerError
+		if resp != nil {
+			sc = resp.StatusCode
 		}
 
-		id, ok := authentication.GetTenantID(r.Context())
-		if !ok {
-			const msg = "error finding tenant ID"
-			level.Warn(logger).Log("msg", msg)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
+		level.Error(rh.logger).Log("msg", "could not set rules", "err", err.Error())
+		http.Error(w, "error creating rules", sc)
 
-		name := chi.URLParam(r, "name")
+		return
+	}
 
-		defer r.Body.Close()
+	defer resp.Body.Close()
 
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			const msg = "failed to read rules from request body"
-			level.Warn(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		var group RuleGroup
-		if err := yaml.Unmarshal(body, &group); err != nil {
-			const msg = "failed to unmarshal YAML to rule group"
-			level.Warn(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		for i := range group.Rules {
-			if group.Rules[i].Labels == nil {
-				group.Rules[i].Labels = make(map[string]string)
-			}
-			group.Rules[i].Labels[label] = id
-		}
-
-		rules, err := yaml.Marshal(group.Rules)
-		if err != nil {
-			const msg = "failed to unmarshal YAML to rule group"
-			level.Warn(logger).Log("msg", msg, "err", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-			return
-		}
-
-		switch r.Method {
-		case http.MethodPost:
-			if err := repository.CreateRule(r.Context(), tenant, name, int64(group.Interval), rules); err != nil {
-				const msg = "failed to create rules"
-				level.Warn(logger).Log("msg", msg, "err", err)
-				http.Error(w, msg, http.StatusInternalServerError)
-				return
-			}
-		case http.MethodPut:
-			if err := repository.UpdateRule(r.Context(), tenant, name, int64(group.Interval), rules); err != nil {
-				const msg = "failed to update rules"
-				level.Warn(logger).Log("msg", msg, "err", err)
-				http.Error(w, msg, http.StatusInternalServerError)
-				return
-			}
-		}
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		http.Error(w, "error writing rules response", http.StatusInternalServerError)
+		return
 	}
 }

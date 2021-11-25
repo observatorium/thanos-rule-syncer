@@ -2,6 +2,8 @@
 package http
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -40,36 +42,36 @@ func Logger(logger log.Logger) HandlerOption {
 	}
 }
 
-// Registry adds a custom Prometheus registry for the handler to use.
-func Registry(r *prometheus.Registry) HandlerOption {
+// WithRegistry adds a custom Prometheus registry for the handler to use.
+func WithRegistry(r *prometheus.Registry) HandlerOption {
 	return func(h *handlerConfiguration) {
 		h.registry = r
 	}
 }
 
-// HandlerInstrumenter adds a custom HTTP handler instrument middleware for the handler to use.
-func HandlerInstrumenter(instrumenter handlerInstrumenter) HandlerOption {
+// WithHandlerInstrumenter adds a custom HTTP handler instrument middleware for the handler to use.
+func WithHandlerInstrumenter(instrumenter handlerInstrumenter) HandlerOption {
 	return func(h *handlerConfiguration) {
 		h.instrument = instrumenter
 	}
 }
 
-// SpanRoutePrefix adds a prefix before the value of route tag in tracing spans.
-func SpanRoutePrefix(spanRoutePrefix string) HandlerOption {
+// WithSpanRoutePrefix adds a prefix before the value of route tag in tracing spans.
+func WithSpanRoutePrefix(spanRoutePrefix string) HandlerOption {
 	return func(h *handlerConfiguration) {
 		h.spanRoutePrefix = spanRoutePrefix
 	}
 }
 
-// ReadMiddleware adds a middleware for all read operations.
-func ReadMiddleware(m func(http.Handler) http.Handler) HandlerOption {
+// WithReadMiddleware adds a middleware for all read operations.
+func WithReadMiddleware(m func(http.Handler) http.Handler) HandlerOption {
 	return func(h *handlerConfiguration) {
 		h.readMiddlewares = append(h.readMiddlewares, m)
 	}
 }
 
-// WriteMiddleware adds a middleware for all write operations.
-func WriteMiddleware(m func(http.Handler) http.Handler) HandlerOption {
+// WithWriteMiddleware adds a middleware for all write operations.
+func WithWriteMiddleware(m func(http.Handler) http.Handler) HandlerOption {
 	return func(h *handlerConfiguration) {
 		h.writeMiddlewares = append(h.writeMiddlewares, m)
 	}
@@ -85,7 +87,7 @@ func (n nopInstrumentHandler) NewHandler(labels prometheus.Labels, handler http.
 	return handler.ServeHTTP
 }
 
-func NewHandler(read, tail, write *url.URL, opts ...HandlerOption) http.Handler {
+func NewHandler(read, tail, write *url.URL, upstreamCA []byte, opts ...HandlerOption) http.Handler {
 	c := &handlerConfiguration{
 		logger:     log.NewNopLogger(),
 		registry:   prometheus.NewRegistry(),
@@ -108,16 +110,23 @@ func NewHandler(read, tail, write *url.URL, opts ...HandlerOption) http.Handler 
 				proxy.MiddlewareMetrics(c.registry, prometheus.Labels{"proxy": "logsv1-read"}),
 			)
 
+			t := &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: ReadTimeout,
+				}).DialContext,
+			}
+
+			if len(upstreamCA) != 0 {
+				t.TLSClientConfig = &tls.Config{
+					RootCAs: x509.NewCertPool(),
+				}
+				t.TLSClientConfig.RootCAs.AppendCertsFromPEM(upstreamCA)
+			}
+
 			proxyRead = &httputil.ReverseProxy{
-				Director: middlewares,
-				ErrorLog: proxy.Logger(c.logger),
-				Transport: otelhttp.NewTransport(
-					&http.Transport{
-						DialContext: (&net.Dialer{
-							Timeout: ReadTimeout,
-						}).DialContext,
-					},
-				),
+				Director:  middlewares,
+				ErrorLog:  proxy.Logger(c.logger),
+				Transport: otelhttp.NewTransport(t),
 			}
 		}
 		r.Group(func(r chi.Router) {
@@ -199,16 +208,23 @@ func NewHandler(read, tail, write *url.URL, opts ...HandlerOption) http.Handler 
 				proxy.MiddlewareMetrics(c.registry, prometheus.Labels{"proxy": "logsv1-tail"}),
 			)
 
+			t := &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: ReadTimeout,
+				}).DialContext,
+			}
+
+			if len(upstreamCA) != 0 {
+				t.TLSClientConfig = &tls.Config{
+					RootCAs: x509.NewCertPool(),
+				}
+				t.TLSClientConfig.RootCAs.AppendCertsFromPEM(upstreamCA)
+			}
+
 			tailRead = &httputil.ReverseProxy{
-				Director: middlewares,
-				ErrorLog: proxy.Logger(c.logger),
-				Transport: otelhttp.NewTransport(
-					&http.Transport{
-						DialContext: (&net.Dialer{
-							Timeout: ReadTimeout,
-						}).DialContext,
-					},
-				),
+				Director:  middlewares,
+				ErrorLog:  proxy.Logger(c.logger),
+				Transport: t,
 			}
 		}
 		r.Group(func(r chi.Router) {
@@ -238,16 +254,23 @@ func NewHandler(read, tail, write *url.URL, opts ...HandlerOption) http.Handler 
 				proxy.MiddlewareMetrics(c.registry, prometheus.Labels{"proxy": "logsv1-write"}),
 			)
 
+			t := &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout: WriteTimeout,
+				}).DialContext,
+			}
+
+			if len(upstreamCA) != 0 {
+				t.TLSClientConfig = &tls.Config{
+					RootCAs: x509.NewCertPool(),
+				}
+				t.TLSClientConfig.RootCAs.AppendCertsFromPEM(upstreamCA)
+			}
+
 			proxyWrite = &httputil.ReverseProxy{
-				Director: middlewares,
-				ErrorLog: proxy.Logger(c.logger),
-				Transport: otelhttp.NewTransport(
-					&http.Transport{
-						DialContext: (&net.Dialer{
-							Timeout: ReadTimeout,
-						}).DialContext,
-					},
-				),
+				Director:  middlewares,
+				ErrorLog:  proxy.Logger(c.logger),
+				Transport: otelhttp.NewTransport(t),
 			}
 		}
 		r.Group(func(r chi.Router) {

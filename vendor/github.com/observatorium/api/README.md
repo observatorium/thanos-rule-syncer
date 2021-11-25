@@ -7,6 +7,20 @@
 This project is an API server for Observatorium.
 The API provides an authenticated and authorized, multi-tenant interface for writing and reading observability signals, i.e. metrics and logs.
 
+## Getting started
+
+For a quick start, run:
+
+```bash
+make test-interactive
+```
+
+This command spins up a full setup for Observatorium API with all dependent services. It is intended for short-lived manual testing on your local environment.
+
+It is also possible to run the [test](test/e2e/interactive_test.go) with flags '-v' (to see the output) and '-test.timeout=9999m' to ensure the test is not terminated.
+
+Since this starts all necessary services in a Docker environment, make sure you have [Docker](https://docs.docker.com/get-docker/) installed.
+
 ## Backends
 
 The Observatorium API server fulfills requests by proxying reads and writes to a backend for each type of observability signal.
@@ -25,6 +39,10 @@ Compatible backends must implement the Prometheus HTTP API, e.g. Prometheus, Tha
 
 The backend to which to write metrics can be specified with the `--metrics.write.endpoint` flag.
 Compatible backends must implement the Prometheus remote-write API, e.g. Thanos receiver, Cortex, etc.
+
+#### --metrics.rules.endpoint
+
+The rules backend to where rules can be stored can be specified with the `--metrics.rules.endpoint` flag.
 
 ### Logs
 
@@ -51,8 +69,6 @@ Compatible backends must implement the Loki write API, e.g. Loki.
 [embedmd]:# (tmp/help.txt)
 ```txt
 Usage of ./observatorium-api:
-  -database.dsn string
-    	This is the DataSourceName used to connect to a Postgres database.
   -debug.block-profile-rate int
     	The percentage of goroutine blocking events that are reported in the blocking profile. (default 10)
   -debug.mutex-profile-fraction int
@@ -77,14 +93,20 @@ Usage of ./observatorium-api:
     	The endpoint against which to make tail read requests for logs.
   -logs.tenant-header string
     	The name of the HTTP header containing the tenant ID to forward to the logs upstream. (default "X-Scope-OrgID")
+  -logs.tls.ca-file string
+    	File containing the TLS CA against which to upstream logs servers. Leave blank to disable TLS.
   -logs.write.endpoint string
     	The endpoint against which to make write requests for logs.
   -metrics.read.endpoint string
     	The endpoint against which to send read requests for metrics. It used as a fallback to 'query.endpoint' and 'query-range.endpoint'.
+  -metrics.rules.endpoint string
+    	The endpoint against which to make get requests for listing recording/alerting rules and put requests for creating/updating recording/alerting rules.
   -metrics.tenant-header string
     	The name of the HTTP header containing the tenant ID to forward to the metrics upstreams. (default "THANOS-TENANT")
   -metrics.tenant-label string
     	The name of the PromQL label that should hold the tenant ID in metrics upstreams. (default "tenant_id")
+  -metrics.tls.ca-file string
+    	File containing the TLS CA against which to upstream metrics servers. Leave blank to disable TLS.
   -metrics.write.endpoint string
     	The endpoint against which to make write requests for metrics.
   -middleware.backlog-duration-concurrent-requests duration
@@ -105,6 +127,10 @@ Usage of ./observatorium-api:
     	File containing the TLS CA against which to verify servers. If no server CA is specified, the client will use the system certificates.
   -tls.healthchecks.server-name string
     	Server name is used to verify the hostname of the certificates returned by the server. If no server name is specified, the server name will be inferred from the healthcheck URL.
+  -tls.internal.server.cert-file string
+    	File containing the default x509 Certificate for internal HTTPS. Leave blank to disable TLS.
+  -tls.internal.server.key-file string
+    	File containing the default x509 private key matching --tls.internal.server.cert-file. Leave blank to disable TLS.
   -tls.min-version string
     	Minimum TLS version supported. Value must match version names from https://golang.org/pkg/crypto/tls/#pkg-constants. (default "VersionTLS13")
   -tls.reload-interval duration

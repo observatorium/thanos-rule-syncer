@@ -3,7 +3,6 @@ include .bingo/Variables.mk
 SHELL=/usr/bin/env bash -o pipefail
 TMP_DIR := $(shell pwd)/tmp
 BIN_DIR ?= $(TMP_DIR)/bin
-CERT_DIR ?= $(TMP_DIR)/certs
 FIRST_GOPATH := $(firstword $(subst :, ,$(shell go env GOPATH)))
 OS ?= $(shell uname -s | tr '[A-Z]' '[a-z]')
 ARCH ?= $(shell uname -m)
@@ -13,7 +12,7 @@ BIN_NAME ?= observatorium-api
 VERSION := $(strip $(shell [ -d .git ] && git describe --always --tags --dirty))
 BUILD_DATE := $(shell date -u +"%Y-%m-%d")
 BUILD_TIMESTAMP := $(shell date -u +"%Y-%m-%dT%H:%M:%S%Z")
-VCS_BRANCH := $(strip $(shell git rev-parse --abbrev-ref HEAD))
+VCS_BRANCH := $(strip $(shell git rev-parse --abbrev-ref HEAD | tr / -))
 VCS_REF := $(strip $(shell [ -d .git ] && git rev-parse --short HEAD))
 DOCKER_REPO ?= quay.io/observatorium/api
 
@@ -26,32 +25,15 @@ CONTAINER_CMD := docker run --rm \
 		-e GO111MODULE=on \
 		quay.io/coreos/jsonnet-ci
 
-THANOS ?= $(BIN_DIR)/thanos
-THANOS_VERSION ?= 0.13.0
 PROMETHEUS ?= $(BIN_DIR)/prometheus
 PROMETHEUS_VERSION ?= 2.15.2
-LOKI ?= $(BIN_DIR)/loki
-LOKI_VERSION ?= 1.5.0
-WEBSOCAT ?= $(BIN_DIR)/websocat
-WEBSOCAT_VERSION ?= 1.5.0
-WEBSOCAT_PKG =
-ifeq ($(shell go env GOOS),linux)
-	WEBSOCAT_PKG = "websocat_amd64-linux"
-else
-	WEBSOCAT_PKG = "websocat_mac"
-endif
 PROMREMOTEBENCH ?= $(BIN_DIR)/promremotebench
 PROMREMOTEBENCH_VERSION ?= 0.8.0
 SHELLCHECK ?= $(BIN_DIR)/shellcheck
 MOCKPROVIDER ?= $(BIN_DIR)/mockprovider
-COCKROACH ?= $(BIN_DIR)/cockroach
-MIGRATE ?= $(BIN_DIR)/migrate
-GENERATE_TLS_CERT ?= $(BIN_DIR)/generate-tls-cert
 
 PROTOC ?= $(TMP_DIR)/protoc
 PROTOC_VERSION ?= 3.13.0
-
-SERVER_CERT ?= $(CERT_DIR)/server.pem
 
 default: $(BIN_NAME)
 all: clean lint test $(BIN_NAME) generate validate
@@ -70,15 +52,16 @@ benchmark.md: $(EMBEDMD) tmp/load_help.txt
 	PATH=$$PATH:$(BIN_DIR):$(FIRST_GOPATH)/bin ./test/load.sh -r 300 -c 1000 -m 3 -q 10 -o gnuplot
 	$(EMBEDMD) -w docs/benchmark.md
 
-$(BIN_NAME): deps main.go $(wildcard *.go) $(wildcard */*.go)
+$(BIN_NAME): deps main.go rules/rules.go $(wildcard *.go) $(wildcard */*.go)
 	CGO_ENABLED=0 GOOS=$(OS) GOARCH=$(GOARCH) GO111MODULE=on GOPROXY=https://proxy.golang.org go build -a -ldflags '-s -w' -o $(BIN_NAME) .
+
+%.y.go: %.y | $(GOYACC)
+	$(GOYACC) -p $(basename $(notdir $<)) -o $@ $<
+	sed -i.back '/^\/\/line/ d' $@
+	rm ${@}.back
 
 .PHONY: build
 build: $(BIN_NAME)
-
-.PHONY: run
-run: build $(THANOS) $(DEX) $(LOKI) generate-cert
-	PATH=$$PATH:$(BIN_DIR):$(FIRST_GOPATH)/bin DEX=$(DEX) ./test/run-local.sh
 
 .PHONY: deps
 deps: go.mod go.sum
@@ -99,15 +82,19 @@ lint: $(GOLANGCI_LINT) deps shellcheck jsonnet-fmt
 	$(GOLANGCI_LINT) run -v --enable-all -c .golangci.yml
 
 .PHONY: test
-test: build test-unit test-integration
+test: build test-unit
 
 .PHONY: test-unit
 test-unit:
-	CGO_ENABLED=1 GO111MODULE=on go test -v -race -short ./...
+	CGO_ENABLED=1 GO111MODULE=on go test -v -race -short $(shell go list ./... | grep -v api/test/e2e)
 
-.PHONY: test-integration
-test-integration: build integration-test-dependencies generate-cert
-	THANOS=$(THANOS) UP=$(UP) DEX=$(DEX) LOKI=$(LOKI) WEBSOCAT=$(WEBSOCAT) OPA=$(OPA) GUBERNATOR=$(GUBERNATOR) MIGRATE=$(MIGRATE) COCKROACH=$(COCKROACH) ./test/integration.sh
+.PHONY: test-e2e
+test-e2e: container-test
+	CGO_ENABLED=1 GO111MODULE=on go test -v -race -short --tags integration ./test/e2e
+
+.PHONY: test-interactive
+test-interactive: container-test
+	CGO_ENABLED=1 GO111MODULE=on go test -v -tags interactive -test.timeout=9999m ./test/e2e
 
 .PHONY: test-load
 test-load: build load-test-dependencies
@@ -134,6 +121,20 @@ proto: ratelimit/gubernator/proto/google ratelimit/gubernator/gubernator.proto $
 	@cp -f $(PROTOC_GEN_GO) $(BIN_DIR)/protoc-gen-go
 	PATH=$$PATH:$(BIN_DIR):$(FIRST_GOPATH)/bin scripts/generate_proto.sh
 
+.PHONY: container-test
+container-test: # Use 'shortcut' to build test image if on Linux, otherwise full build.
+ifeq ($(OS), linux)
+container-test: build
+	@docker build \
+		-f Dockerfile.e2e-test \
+		-t $(DOCKER_REPO):local_e2e_test .
+else
+container-test:
+	@docker build \
+		-f Dockerfile \
+		-t $(DOCKER_REPO):local_e2e_test .
+endif
+
 .PHONY: container
 container: Dockerfile
 	@docker build --build-arg BUILD_DATE="$(BUILD_TIMESTAMP)" \
@@ -157,20 +158,8 @@ container-release: container
 	docker push $(DOCKER_REPO):$(VERSION_TAG)
 	docker push $(DOCKER_REPO):latest
 
-.PHONY: integration-test-dependencies
-integration-test-dependencies: $(THANOS) $(UP) $(DEX) $(LOKI) $(WEBSOCAT) $(OPA) $(GUBERNATOR) $(COCKROACH) $(MIGRATE)
-
 .PHONY: load-test-dependencies
 load-test-dependencies: $(PROMREMOTEBENCH) $(PROMETHEUS) $(STYX) $(MOCKPROVIDER)
-
-.PHONY: test-dependencies
-test-dependencies: $(THANOS) $(UP) $(EMBEDMD) $(GOLANGCI_LINT) $(SHELLCHECK)
-
-$(SERVER_CERT): | $(GENERATE_TLS_CERT) $(CERT_DIR)
-	cd $(CERT_DIR) && $(GENERATE_TLS_CERT)
-
-# Generate TLS certificates for local development.
-generate-cert: $(SERVER_CERT) | $(GENERATE_TLS_CERT)
 
 $(TMP_DIR):
 	mkdir -p $(TMP_DIR)
@@ -178,30 +167,9 @@ $(TMP_DIR):
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
-$(CERT_DIR):
-	mkdir -p $(CERT_DIR)
-
-$(THANOS): | $(BIN_DIR)
-	@echo "Downloading Thanos"
-	curl -L "https://github.com/thanos-io/thanos/releases/download/v$(THANOS_VERSION)/thanos-$(THANOS_VERSION).$$(go env GOOS)-$$(go env GOARCH).tar.gz" | tar --strip-components=1 -xzf - -C $(BIN_DIR)
-
 $(PROMETHEUS): | $(BIN_DIR)
 	@echo "Downloading Prometheus"
 	curl -L "https://github.com/prometheus/prometheus/releases/download/v$(PROMETHEUS_VERSION)/prometheus-$(PROMETHEUS_VERSION).$$(go env GOOS)-$$(go env GOARCH).tar.gz" | tar --strip-components=1 -xzf - -C $(BIN_DIR)
-
-$(LOKI): | $(BIN_DIR)
-	@echo "Downloading Loki"
-	(loki_pkg="loki-$$(go env GOOS)-$$(go env GOARCH)" && \
-	cd $(BIN_DIR) && curl -O -L "https://github.com/grafana/loki/releases/download/v$(LOKI_VERSION)/$$loki_pkg.zip" && \
-	unzip $$loki_pkg.zip && \
-	mv $$loki_pkg loki && \
-	rm $$loki_pkg.zip)
-
-$(WEBSOCAT): | $(BIN_DIR)
-	@echo "Downloading Websocat"
-	cd $(BIN_DIR) && curl -O -L "https://github.com/vi/websocat/releases/download/v$(WEBSOCAT_VERSION)/$(WEBSOCAT_PKG)" && \
-	mv $(WEBSOCAT_PKG) websocat && \
-	chmod u+x websocat
 
 $(PROMREMOTEBENCH): | deps $(BIN_DIR)
 	mkdir -p $(TMP_DIR)/src/promremotebench
@@ -210,32 +178,21 @@ $(PROMREMOTEBENCH): | deps $(BIN_DIR)
 		go build ./cmd/promremotebench
 	mv $(TMP_DIR)/src/promremotebench/promremotebench $@
 
-$(SHELLCHECK): | $(BIN_DIR)
+$(SHELLCHECK): $(BIN_DIR)
 	curl -sNL "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.$(OS).$(ARCH).tar.xz" | tar --strip-components=1 -xJf - -C $(BIN_DIR)
 
 $(MOCKPROVIDER): | deps $(BIN_DIR)
 	go build -tags tools -o $@ github.com/observatorium/api/test/mock
 
-$(GENERATE_TLS_CERT): | deps $(BIN_DIR)
-	# A thin wrapper around github.com/cloudflare/cfssl
-	go build -tags tools -o $@ github.com/observatorium/api/test/tls
-
-$(PROTOC): | $(TMP_DIR) $(BIN_DIR)
+$(PROTOC): $(TMP_DIR) $(BIN_DIR)
 	@PROTOC_VERSION="$(PROTOC_VERSION)" TMP_DIR="$(TMP_DIR)" BIN_DIR="$(BIN_DIR)" scripts/install_protoc.sh
-
-$(COCKROACH): | $(BIN_DIR)
-	curl https://binaries.cockroachdb.com/cockroach-v21.1.2.linux-amd64.tgz | tar --strip-components=1 -xz -C $(BIN_DIR)
-
-$(MIGRATE): | $(BIN_DIR)
-	curl -L https://github.com/golang-migrate/migrate/releases/download/v4.14.1/migrate.linux-amd64.tar.gz | tar --strip-components=1 -xz -C $(BIN_DIR)
-	mv $(BIN_DIR)/migrate.linux-amd64 $@
 
 # Jsonnet and Example manifests.
 
 MANIFESTS := examples/manifests
 
 .PHONY: generate
-generate: ${MANIFESTS} README.md
+generate: ${MANIFESTS} rules/rules.go README.md
 
 .PHONY: ${MANIFESTS}
 ${MANIFESTS}: examples/main.jsonnet jsonnet/lib/* | $(JSONNET) $(GOJSONTOYAML)
@@ -253,3 +210,6 @@ JSONNETFMT_CMD := $(JSONNETFMT) -n 2 --max-blank-lines 2 --string-style s --comm
 .PHONY: jsonnet-fmt
 jsonnet-fmt: | $(JSONNETFMT)
 	PATH=$$PATH:$(BIN_DIR):$(FIRST_GOPATH)/bin echo ${JSONNET_SRC} | xargs -n 1 -- $(JSONNETFMT_CMD) -i
+
+rules/rules.go: $(OAPI_CODEGEN) rules/spec.yaml
+	$(OAPI_CODEGEN) -generate types,client,chi-server -package rules rules/spec.yaml | sed 's|gopkg.in/yaml.v2|github.com/ghodss/yaml|g' | gofmt -s > $@
