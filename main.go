@@ -1,16 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"time"
 
 	"github.com/coreos/go-oidc"
@@ -25,6 +28,7 @@ type config struct {
 	observatoriumCA  string
 	thanosRuleURL    string
 	file             string
+	tenant           string
 	oidc             oidcConfig
 	interval         uint
 }
@@ -38,7 +42,8 @@ type oidcConfig struct {
 
 func parseFlags() *config {
 	cfg := &config{}
-	flag.StringVar(&cfg.observatoriumURL, "observatorium-api-url", "", "The URL of the Observatorium API from where to fetch the rules. This should be the full ULR including the path to the tenant's rules.")
+	flag.StringVar(&cfg.observatoriumURL, "observatorium-api-url", "", "The URL of the Observatorium API from which to fetch the rules.")
+	flag.StringVar(&cfg.tenant, "tenant", "", "The name of the tenant whose rules should be synced.")
 	flag.StringVar(&cfg.observatoriumCA, "observatorium-ca", "", "Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.")
 	flag.StringVar(&cfg.thanosRuleURL, "thanos-rule-url", "", "The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload.")
 	flag.StringVar(&cfg.file, "file", "", "The path to the file the rules are written to on disk so that Thanos Ruler can read it from.")
@@ -101,36 +106,47 @@ func main() {
 
 	}
 
+	u, err := url.Parse(cfg.observatoriumURL)
+	if err != nil {
+		log.Fatalf("failed to parse Observatorium API URL: %v", err)
+	}
+	u.Path = path.Join("/api/metrics/v1", cfg.tenant, "/api/v1/rules/raw")
+
 	var gr run.Group
 	gr.Add(run.SignalHandler(ctx, os.Interrupt))
 
 	gr.Add(func() error {
+		fn := func(ctx context.Context) error {
+			rules, err := getRules(ctx, client, u.String())
+			if err != nil {
+				return fmt.Errorf("failed to get rules from url: %v\n", err)
+			}
+			defer rules.Close()
+			file, err := os.Create(cfg.file)
+			if err != nil {
+				return fmt.Errorf("failed to create or open the rules file %s: %v", cfg.file, err)
+			}
+			w := bufio.NewWriter(file)
+			if _, err = w.ReadFrom(rules); err != nil {
+				return fmt.Errorf("failed to write to rules file %s: %v", cfg.file, err)
+			}
+			if err := file.Close(); err != nil {
+				return fmt.Errorf("failed to close the rules file %s: %v", cfg.file, err)
+			}
+			if err := reloadThanosRule(ctx, client, cfg.thanosRuleURL); err != nil {
+				return fmt.Errorf("failed to trigger thanos rule reload: %v", err)
+			}
+			return nil
+		}
+		if err := fn(ctx); err != nil {
+			log.Print(err.Error())
+		}
 		ticker := time.NewTicker(time.Duration(cfg.interval) * time.Second)
 		for {
 			select {
 			case <-ticker.C:
-				rules, err := getRules(ctx, client, cfg.observatoriumURL)
-				if err != nil {
-					log.Printf("failed to get rules from url: %v\n", err)
-					continue
-				}
-				file, err := os.Create(cfg.file)
-				if err != nil {
-					log.Printf("failed to create or open the rules file %s: %v", cfg.file, err)
-					continue
-				}
-				if _, err = file.Write(rules); err != nil {
-					log.Printf("failed to write to rules file %s: %v", cfg.file, err)
-					continue
-				}
-				if err := file.Close(); err != nil {
-					log.Printf("failed to close the rules file %s: %v", cfg.file, err)
-					continue
-				}
-
-				if err := reloadThanosRule(ctx, client, cfg.thanosRuleURL); err != nil {
-					log.Printf("failed to trigger thanos rule reload: %v", err)
-					continue
+				if err := fn(ctx); err != nil {
+					log.Print(err.Error())
 				}
 			case <-ctx.Done():
 				return nil
@@ -145,19 +161,22 @@ func main() {
 	}
 }
 
-func getRules(ctx context.Context, client *http.Client, url string) ([]byte, error) {
+func getRules(ctx context.Context, client *http.Client, url string) (io.ReadCloser, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req = req.WithContext(ctx)
 
-	resp, err := client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to do http request: %w", err)
 	}
+	if res.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("got unexpected status from Observatorium API: %d", res.StatusCode)
+	}
 
-	return ioutil.ReadAll(resp.Body)
+	return res.Body, nil
 }
 
 func reloadThanosRule(ctx context.Context, client *http.Client, url string) error {
@@ -167,12 +186,12 @@ func reloadThanosRule(ctx context.Context, client *http.Client, url string) erro
 	}
 	req = req.WithContext(ctx)
 
-	resp, err := client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("thanos rule didn't not return 200 but %d", resp.StatusCode)
+	if res.StatusCode/100 != 2 {
+		return fmt.Errorf("got unexpected status from Thanos Ruler: %d", res.StatusCode)
 	}
 
 	return nil

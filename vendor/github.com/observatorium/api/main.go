@@ -4,9 +4,7 @@ import (
 	"context"
 	stdtls "crypto/tls"
 	"crypto/x509"
-	"database/sql"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,6 +18,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,12 +28,13 @@ import (
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	_ "github.com/lib/pq"
 	"github.com/metalmatze/signal/healthcheck"
 	"github.com/metalmatze/signal/internalserver"
 	"github.com/metalmatze/signal/server/signalhttp"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/version"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
@@ -44,6 +44,7 @@ import (
 	metricslegacy "github.com/observatorium/api/api/metrics/legacy"
 	metricsv1 "github.com/observatorium/api/api/metrics/v1"
 	"github.com/observatorium/api/authentication"
+
 	"github.com/observatorium/api/authorization"
 	"github.com/observatorium/api/logger"
 	"github.com/observatorium/api/opa"
@@ -77,7 +78,6 @@ type config struct {
 	logs            logsConfig
 	middleware      middlewareConfig
 	internalTracing internalTracingConfig
-	database        databaseConfig
 }
 
 type debugConfig struct {
@@ -100,22 +100,30 @@ type tlsConfig struct {
 	serverCertFile string
 	serverKeyFile  string
 
+	internalServerCertFile string
+	internalServerKeyFile  string
+
 	healthchecksServerCAFile string
 	healthchecksServerName   string
 }
 
 type metricsConfig struct {
-	readEndpoint  *url.URL
-	writeEndpoint *url.URL
-	tenantHeader  string
-	tenantLabel   string
+	readEndpoint   *url.URL
+	writeEndpoint  *url.URL
+	rulesEndpoint  *url.URL
+	upstreamCAFile string
+	tenantHeader   string
+	tenantLabel    string
+	// enable metrics if at least one {read|write}Endpoint} is provided.
+	enabled bool
 }
 
 type logsConfig struct {
-	readEndpoint  *url.URL
-	writeEndpoint *url.URL
-	tailEndpoint  *url.URL
-	tenantHeader  string
+	readEndpoint   *url.URL
+	writeEndpoint  *url.URL
+	tailEndpoint   *url.URL
+	upstreamCAFile string
+	tenantHeader   string
 	// enable logs at least one {read,write,tail}Endpoint} is provided.
 	enabled bool
 }
@@ -134,8 +142,51 @@ type internalTracingConfig struct {
 	samplingFraction float64
 }
 
-type databaseConfig struct {
-	dsn string
+type tenant struct {
+	Name string `json:"name"`
+	ID   string `json:"id"`
+	OIDC *struct {
+		ClientID      string `json:"clientID"`
+		ClientSecret  string `json:"clientSecret"`
+		GroupClaim    string `json:"groupClaim"`
+		IssuerRawCA   []byte `json:"issuerCA"`
+		IssuerCAPath  string `json:"issuerCAPath"`
+		issuerCA      *x509.Certificate
+		IssuerURL     string `json:"issuerURL"`
+		RedirectURL   string `json:"redirectURL"`
+		UsernameClaim string `json:"usernameClaim"`
+		config        map[string]interface{}
+	} `json:"oidc"`
+	OpenShift *struct {
+		KubeConfigPath string `json:"kubeconfig"`
+		ServiceAccount string `json:"serviceAccount"`
+		RedirectURL    string `json:"redirectURL"`
+		CookieSecret   string `json:"cookieSecret"`
+		config         map[string]interface{}
+	} `json:"openshift"`
+	Authenticator *struct {
+		Type   string                 `json:"type"`
+		Config map[string]interface{} `json:"config"`
+	} `json:"authenticator"`
+
+	MTLS *struct {
+		RawCA  []byte `json:"ca"`
+		CAPath string `json:"caPath"`
+		cas    []*x509.Certificate
+		config map[string]interface{}
+	} `json:"mTLS"`
+	OPA *struct {
+		Query           string   `json:"query"`
+		Paths           []string `json:"paths"`
+		URL             string   `json:"url"`
+		WithAccessToken bool     `json:"withAccessToken"`
+		authorizer      rbac.Authorizer
+	} `json:"opa"`
+	RateLimits []*struct {
+		Endpoint string   `json:"endpoint"`
+		Limit    int      `json:"limit"`
+		Window   duration `json:"window"`
+	} `json:"rateLimits"`
 }
 
 //nolint:funlen,gocyclo,gocognit
@@ -143,6 +194,11 @@ func main() {
 	cfg, err := parseFlags()
 	if err != nil {
 		stdlog.Fatalf("parse flag: %v", err)
+	}
+
+	if !cfg.metrics.enabled && !cfg.logs.enabled {
+		stdlog.Fatal("Neither logging nor metrics endpoints are enabled. " +
+			"Specifying at least a logging or a metrics endpoint is mandatory")
 	}
 
 	logger := logger.NewLogger(cfg.logLevel, cfg.logFormat, cfg.debug.name)
@@ -162,52 +218,19 @@ func main() {
 
 	otel.SetErrorHandler(otelErrorHandler{logger: logger})
 
-	var db *sql.DB
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		version.NewCollector("observatorium"),
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
 
-	if cfg.database.dsn != "" {
-		db, err = sql.Open("postgres", cfg.database.dsn)
-		if err != nil {
-			stdlog.Fatalf("failed to open database: %v", err)
-		}
-		defer db.Close()
-
-		if err := db.Ping(); err != nil {
-			stdlog.Fatalf("unable to ping the database: %v", err)
-		}
-	}
-
-	type tenant struct {
-		Name         string `json:"name"`
-		ID           string `json:"id"`
-		RuleFilePath string `json:"ruleFilePath"`
-		OIDC         *struct {
-			ClientID      string `json:"clientID"`
-			ClientSecret  string `json:"clientSecret"`
-			GroupClaim    string `json:"groupClaim"`
-			IssuerRawCA   []byte `json:"issuerCA"`
-			IssuerCAPath  string `json:"issuerCAPath"`
-			issuerCA      *x509.Certificate
-			IssuerURL     string `json:"issuerURL"`
-			RedirectURL   string `json:"redirectURL"`
-			UsernameClaim string `json:"usernameClaim"`
-		} `json:"oidc"`
-		MTLS *struct {
-			RawCA  []byte `json:"ca"`
-			CAPath string `json:"caPath"`
-			cas    []*x509.Certificate
-		} `json:"mTLS"`
-		OPA *struct {
-			Query      string   `json:"query"`
-			Paths      []string `json:"paths"`
-			URL        string   `json:"url"`
-			authorizer rbac.Authorizer
-		} `json:"opa"`
-		RateLimits []*struct {
-			Endpoint string   `json:"endpoint"`
-			Limit    int      `json:"limit"`
-			Window   duration `json:"window"`
-		} `json:"rateLimits"`
-	}
+	skippedTenants := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Namespace: "observatorium",
+		Subsystem: "api",
+		Name:      "tenants_skipped_invalid_configuration",
+		Help:      "The number of tenants which have not been configured due to an invalid configuration.",
+	}, []string{"tenant"})
 
 	type tenantsConfig struct {
 		Tenants []*tenant `json:"tenants"`
@@ -227,76 +250,69 @@ func main() {
 		skip := level.Warn(log.With(logger, "msg", "skipping invalid tenant"))
 		for i, t := range tenantsCfg.Tenants {
 			if t.OIDC != nil {
-				if t.OIDC.IssuerCAPath != "" {
-					t.OIDC.IssuerRawCA, err = ioutil.ReadFile(t.OIDC.IssuerCAPath)
-					if err != nil {
-						skip.Log("tenant", t.Name, "err", fmt.Sprintf("cannot read issuer CA certificate file from path %q: %v", t.OIDC.IssuerCAPath, err))
-						tenantsCfg.Tenants[i] = nil
-						continue
-					}
+				oidcConfig, err := unmarshalLegacyAuthenticatorConfig(t.OIDC)
+				if err != nil {
+					skip.Log("msg", "failed to unmarshal legacy OIDC config", "err", err, "tenant", t.Name)
+					skippedTenants.WithLabelValues(t.Name).Inc()
+					tenantsCfg.Tenants[i] = nil
+					continue
 				}
-				if len(t.OIDC.IssuerRawCA) != 0 {
-					block, _ := pem.Decode(t.OIDC.IssuerRawCA)
-					if block == nil {
-						skip.Log("tenant", t.Name, "err", "failed to parse issuer CA certificate PEM")
-						tenantsCfg.Tenants[i] = nil
-						continue
-					}
-					cert, err := x509.ParseCertificate(block.Bytes)
-					if err != nil {
-						skip.Log("tenant", t.Name, "err", fmt.Sprintf("failed to parse issuer certificate: %v", err))
-						tenantsCfg.Tenants[i] = nil
-						continue
-					}
-					t.OIDC.issuerCA = cert
-				}
+
+				t.OIDC.config = oidcConfig
 			}
+
 			if t.MTLS != nil {
-				if t.MTLS.CAPath != "" {
-					t.MTLS.RawCA, err = ioutil.ReadFile(t.MTLS.CAPath)
-					if err != nil {
-						skip.Log("tenant", t.Name, "err", fmt.Sprintf("cannot read CA certificate file from path %q: %v", t.OIDC.IssuerCAPath, err))
-						tenantsCfg.Tenants[i] = nil
-						continue
-					}
+				mTLSConfig, err := unmarshalLegacyAuthenticatorConfig(t.MTLS)
+				if err != nil {
+					skip.Log("msg", "failed to unmarshal legacy mTLS config", "err", err, "tenant", t.Name)
+					skippedTenants.WithLabelValues(t.Name).Inc()
+					tenantsCfg.Tenants[i] = nil
+					continue
 				}
-				var (
-					block *pem.Block
-					rest  []byte = t.MTLS.RawCA
-					cert  *x509.Certificate
-				)
-				for {
-					block, rest = pem.Decode(rest)
-					if block == nil {
-						skip.Log("tenant", t.Name, "err", "failed to parse CA certificate PEM")
-						tenantsCfg.Tenants[i] = nil
-						break
-					}
-					cert, err = x509.ParseCertificate(block.Bytes)
-					if err != nil {
-						skip.Log("tenant", t.Name, "err", fmt.Sprintf("failed to parse CA certificate: %v", err))
-						tenantsCfg.Tenants[i] = nil
-						break
-					}
-					t.MTLS.cas = append(t.MTLS.cas, cert)
-					if len(rest) == 0 {
-						break
-					}
+				t.MTLS.config = mTLSConfig
+			}
+
+			if t.OpenShift != nil {
+				openshiftConfig, err := unmarshalLegacyAuthenticatorConfig(t.OpenShift)
+				if err != nil {
+					skip.Log("msg", "failed to unmarshal legacy openshift config", "err", err, "tenant", t.Name)
+					skippedTenants.WithLabelValues(t.Name).Inc()
+					tenantsCfg.Tenants[i] = nil
+					continue
+				}
+				t.OpenShift.config = openshiftConfig
+			}
+
+			if t.Authenticator != nil {
+				if t.Authenticator.Config == nil {
+					skip.Log("tenant", t.Name, "err", "failed to find authenticator config")
+					skippedTenants.WithLabelValues(t.Name).Inc()
+					tenantsCfg.Tenants[i] = nil
+					continue
 				}
 			}
+
 			if t.OPA != nil {
 				if t.OPA.URL != "" {
 					u, err := url.Parse(t.OPA.URL)
 					if err != nil {
 						skip.Log("tenant", t.Name, "err", fmt.Sprintf("failed to parse OPA URL: %v", err))
+						skippedTenants.WithLabelValues(t.Name).Inc()
 						tenantsCfg.Tenants[i] = nil
 						continue
 					}
-					t.OPA.authorizer = opa.NewRESTAuthorizer(u, opa.LoggerOption(log.With(logger, "tenant", t.Name)))
+					t.OPA.authorizer = opa.NewRESTAuthorizer(u,
+						opa.LoggerOption(log.With(logger, "tenant", t.Name)),
+						opa.AccessTokenOption(t.OPA.WithAccessToken),
+					)
 				} else {
-					a, err := opa.NewInProcessAuthorizer(t.OPA.Query, t.OPA.Paths, opa.LoggerOption(log.With(logger, "tenant", t.Name)))
+					a, err := opa.NewInProcessAuthorizer(t.OPA.Query, t.OPA.Paths,
+						opa.LoggerOption(log.With(logger, "tenant", t.Name)),
+						opa.AccessTokenOption(t.OPA.WithAccessToken),
+					)
 					if err != nil {
 						skip.Log("tenant", t.Name, "err", fmt.Sprintf("failed to create in-process OPA authorizer: %v", err))
+						skippedTenants.WithLabelValues(t.Name).Inc()
 						tenantsCfg.Tenants[i] = nil
 						continue
 					}
@@ -317,13 +333,6 @@ func main() {
 			stdlog.Fatalf("unable to read RBAC YAML: %v", err)
 		}
 	}
-
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(
-		version.NewCollector("observatorium"),
-		prometheus.NewGoCollector(),
-		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
-	)
 
 	healthchecks := healthcheck.NewMetricsHandler(healthcheck.NewHandler(), reg)
 
@@ -393,10 +402,29 @@ func main() {
 					&http.Client{Transport: t},
 					cfg.server.healthcheckURL,
 					http.MethodGet,
-					http.StatusNotFound,
+					http.StatusOK,
 					time.Second,
 				),
 			)
+		}
+
+		var (
+			metricsUpstreamCACert []byte
+			logsUpstreamCACert    []byte
+		)
+
+		if cfg.metrics.upstreamCAFile != "" {
+			metricsUpstreamCACert, err = ioutil.ReadFile(cfg.metrics.upstreamCAFile)
+			if err != nil {
+				stdlog.Fatalf("failed to read upstream metrics TLS CA: %v", err)
+			}
+		}
+
+		if cfg.logs.upstreamCAFile != "" {
+			logsUpstreamCACert, err = ioutil.ReadFile(cfg.logs.upstreamCAFile)
+			if err != nil {
+				stdlog.Fatalf("failed to read upstream logs TLS CA: %v", err)
+			}
 		}
 
 		r := chi.NewRouter()
@@ -414,18 +442,22 @@ func main() {
 
 		r.Group(func(r chi.Router) {
 			tenantIDs := map[string]string{}
-			tenantRuleFilePaths := map[string]string{}
-			var oidcs []authentication.TenantOIDCConfig
-			var mTLSs []authentication.MTLSConfig
 			authorizers := map[string]rbac.Authorizer{}
 			var rateLimits []ratelimit.Config
+			// registrationRetryCount used by authenticator providers to count
+			// registration failures per tenant.
+			registerTenantsFailingMetric := authentication.RegisterTenantsFailingMetric(reg)
+			pm := authentication.NewProviderManager(logger, registerTenantsFailingMetric)
+
+			// registeredAuthNRoutes is used to avoid double register the same pattern.
+			var regMtx sync.RWMutex
+			registeredAuthNRoutes := make(map[string]struct{})
 			for _, t := range tenantsCfg.Tenants {
 				if t == nil {
 					continue
 				}
 				level.Info(logger).Log("msg", "adding a tenant", "tenant", t.Name)
 				tenantIDs[t.Name] = t.ID
-				tenantRuleFilePaths[t.Name] = t.RuleFilePath
 				if t.RateLimits != nil {
 					for _, rl := range t.RateLimits {
 						matcher, err := regexp.Compile(rl.Endpoint)
@@ -440,28 +472,25 @@ func main() {
 						})
 					}
 				}
-				switch {
-				case t.OIDC != nil:
-					oidcs = append(oidcs, authentication.TenantOIDCConfig{
-						Tenant: t.Name,
-						OIDCConfig: authentication.OIDCConfig{
-							ClientID:      t.OIDC.ClientID,
-							ClientSecret:  t.OIDC.ClientSecret,
-							GroupClaim:    t.OIDC.GroupClaim,
-							IssuerCA:      t.OIDC.issuerCA,
-							IssuerURL:     t.OIDC.IssuerURL,
-							RedirectURL:   t.OIDC.RedirectURL,
-							UsernameClaim: t.OIDC.UsernameClaim,
-						},
-					})
-				case t.MTLS != nil:
-					mTLSs = append(mTLSs, authentication.MTLSConfig{
-						Tenant: t.Name,
-						CAs:    t.MTLS.cas,
-					})
-				default:
-					stdlog.Fatalf("tenant %q must specify either an OIDC or an mTLS configuration", t.Name)
+
+				authenticatorConfig, authenticatorType, err := tenantAuthenticatorConfig(t)
+				if err != nil {
+					stdlog.Fatalf(err.Error())
 				}
+
+				go func(config map[string]interface{}, authType, tenant string) {
+					initializedAuthenticator := <-pm.InitializeProvider(config, tenant, authType, registerTenantsFailingMetric, logger)
+					if initializedAuthenticator != nil {
+						pattern, _ := initializedAuthenticator.Handler()
+						regMtx.Lock()
+						defer regMtx.Unlock()
+						if _, ok := registeredAuthNRoutes[pattern]; !ok && pattern != "" {
+							registeredAuthNRoutes[pattern] = struct{}{}
+							r.Mount(pattern, pm.PatternHandler(pattern))
+						}
+					}
+				}(authenticatorConfig, authenticatorType, t.Name)
+
 				if t.OPA != nil {
 					authorizers[t.Name] = t.OPA.authorizer
 				} else {
@@ -471,76 +500,72 @@ func main() {
 
 			r.Use(authentication.WithTenant)
 			r.Use(authentication.WithTenantID(tenantIDs))
+			r.Use(authentication.WithAccessToken())
 
-			oidcHandler, oidcTenantMiddlewares, warnings := authentication.NewOIDC(logger, "/oidc/{tenant}", oidcs)
-			for _, w := range warnings {
-				level.Warn(logger).Log("msg", w.Error())
-			}
-			r.Mount("/oidc/{tenant}", oidcHandler)
-
-			// Metrics
-			r.Group(func(r chi.Router) {
-				r.Use(authentication.WithTenantMiddlewares(oidcTenantMiddlewares, authentication.NewMTLS(mTLSs)))
-				r.Use(authentication.WithTenantHeader(cfg.metrics.tenantHeader, tenantIDs))
-				if rateLimitClient != nil {
-					r.Use(ratelimit.WithSharedRateLimiter(logger, rateLimitClient, rateLimits...))
-				} else {
-					r.Use(ratelimit.WithLocalRateLimiter(rateLimits...))
-				}
-
-				r.HandleFunc("/{tenant}", func(w http.ResponseWriter, r *http.Request) {
-					tenant, ok := authentication.GetTenant(r.Context())
-					if !ok {
-						w.WriteHeader(http.StatusNotFound)
-						return
+			// Metrics.
+			if cfg.metrics.enabled {
+				r.Group(func(r chi.Router) {
+					r.Use(authentication.WithTenantMiddlewares(pm.Middlewares))
+					r.Use(authentication.WithTenantHeader(cfg.metrics.tenantHeader, tenantIDs))
+					if rateLimitClient != nil {
+						r.Use(ratelimit.WithSharedRateLimiter(logger, rateLimitClient, rateLimits...))
+					} else {
+						r.Use(ratelimit.WithLocalRateLimiter(rateLimits...))
 					}
 
-					http.Redirect(w, r, path.Join("/api/metrics/v1/", tenant, "graph"), http.StatusMovedPermanently)
-				})
+					r.HandleFunc("/{tenant}", func(w http.ResponseWriter, r *http.Request) {
+						tenant, ok := authentication.GetTenant(r.Context())
+						if !ok {
+							w.WriteHeader(http.StatusNotFound)
+							return
+						}
 
-				r.Mount("/api/v1/{tenant}",
-					metricslegacy.NewHandler(
-						cfg.metrics.readEndpoint,
-						metricslegacy.Logger(logger),
-						metricslegacy.Registry(reg),
-						metricslegacy.HandlerInstrumenter(ins),
-						metricslegacy.SpanRoutePrefix("/api/v1/{tenant}"),
-						metricslegacy.ReadMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
-						metricslegacy.ReadMiddleware(authorization.WithEnforceTenantLabel(cfg.metrics.tenantLabel)),
-						metricslegacy.UIMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
-					),
-				)
+						http.Redirect(w, r, path.Join("/api/metrics/v1/", tenant, "graph"), http.StatusMovedPermanently)
+					})
 
-				var rulesRepository metricsv1.RulesRepository = &metricsv1.RulesRepositoryNop{}
-
-				if db != nil {
-					rulesRepository = metricsv1.NewRulesRepository(db)
-				} else if len(tenantRuleFilePaths) > 0 {
-					rulesRepository = metricsv1.NewRulesRepositoryFile(tenantRuleFilePaths)
-				}
-
-				r.Mount("/api/metrics/v1/{tenant}",
-					stripTenantPrefix("/api/metrics/v1",
-						metricsv1.NewHandler(
+					r.Mount("/api/v1/{tenant}",
+						metricslegacy.NewHandler(
 							cfg.metrics.readEndpoint,
-							cfg.metrics.writeEndpoint,
-							metricsv1.Logger(logger),
-							metricsv1.Registry(reg),
-							metricsv1.HandlerInstrumenter(ins),
-							metricsv1.SpanRoutePrefix("/api/metrics/v1/{tenant}"),
-							metricsv1.ReadMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
-							metricsv1.EnforceTenantLabel(cfg.metrics.tenantLabel),
-							metricsv1.WriteMiddleware(authorization.WithAuthorizers(authorizers, rbac.Write, "metrics")),
-							metricsv1.WithRulesRepository(rulesRepository),
+							metricsUpstreamCACert,
+							metricslegacy.WithLogger(logger),
+							metricslegacy.WithRegistry(reg),
+							metricslegacy.WithHandlerInstrumenter(ins),
+							metricslegacy.WithSpanRoutePrefix("/api/v1/{tenant}"),
+							metricslegacy.WithQueryMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
+							metricslegacy.WithQueryMiddleware(metricsv1.WithEnforceTenancyOnQuery(cfg.metrics.tenantLabel)),
+							metricslegacy.WithUIMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
 						),
-					),
-				)
-			})
+					)
 
-			// Logs
+					r.Mount("/api/metrics/v1/{tenant}",
+						stripTenantPrefix("/api/metrics/v1",
+							metricsv1.NewHandler(
+								cfg.metrics.readEndpoint,
+								cfg.metrics.writeEndpoint,
+								cfg.metrics.rulesEndpoint,
+								metricsUpstreamCACert,
+								metricsv1.WithLogger(logger),
+								metricsv1.WithRegistry(reg),
+								metricsv1.WithHandlerInstrumenter(ins),
+								metricsv1.WithSpanRoutePrefix("/api/metrics/v1/{tenant}"),
+								metricsv1.WithTenantLabel(cfg.metrics.tenantLabel),
+								metricsv1.WithQueryMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
+								metricsv1.WithQueryMiddleware(metricsv1.WithEnforceTenancyOnQuery(cfg.metrics.tenantLabel)),
+								metricsv1.WithReadMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
+								metricsv1.WithReadMiddleware(metricsv1.WithEnforceTenancyOnMatchers(cfg.metrics.tenantLabel)),
+								metricsv1.WithReadMiddleware(metricsv1.WithEnforceAuthorizationLabels()),
+								metricsv1.WithUIMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "metrics")),
+								metricsv1.WithWriteMiddleware(authorization.WithAuthorizers(authorizers, rbac.Write, "metrics")),
+							),
+						),
+					)
+				})
+			}
+
+			// Logs.
 			if cfg.logs.enabled {
 				r.Group(func(r chi.Router) {
-					r.Use(authentication.WithTenantMiddlewares(oidcTenantMiddlewares, authentication.NewMTLS(mTLSs)))
+					r.Use(authentication.WithTenantMiddlewares(pm.Middlewares))
 					r.Use(authentication.WithTenantHeader(cfg.logs.tenantHeader, tenantIDs))
 
 					r.Mount("/api/logs/v1/{tenant}",
@@ -549,12 +574,14 @@ func main() {
 								cfg.logs.readEndpoint,
 								cfg.logs.tailEndpoint,
 								cfg.logs.writeEndpoint,
+								logsUpstreamCACert,
 								logsv1.Logger(logger),
-								logsv1.Registry(reg),
-								logsv1.HandlerInstrumenter(ins),
-								logsv1.SpanRoutePrefix("/api/logs/v1/{tenant}"),
-								logsv1.ReadMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "logs")),
-								logsv1.WriteMiddleware(authorization.WithAuthorizers(authorizers, rbac.Write, "logs")),
+								logsv1.WithRegistry(reg),
+								logsv1.WithHandlerInstrumenter(ins),
+								logsv1.WithSpanRoutePrefix("/api/logs/v1/{tenant}"),
+								logsv1.WithReadMiddleware(authorization.WithAuthorizers(authorizers, rbac.Read, "logs")),
+								logsv1.WithReadMiddleware(logsv1.WithEnforceAuthorizationLabels()),
+								logsv1.WithWriteMiddleware(authorization.WithAuthorizers(authorizers, rbac.Write, "logs")),
 							),
 						),
 					)
@@ -593,6 +620,8 @@ func main() {
 			})
 		}
 
+		r.Get("/", server.PathsHandlerFunc(logger, r.Routes()))
+
 		s := http.Server{
 			Addr:         cfg.server.listen,
 			Handler:      otelhttp.NewHandler(r, "api", otelhttp.WithTracerProvider(tp)),
@@ -629,13 +658,53 @@ func main() {
 			internalserver.WithPProf(),
 		)
 
+		internalTLSConfig, err := tls.NewServerConfig(
+			log.With(logger, "protocol", "HTTP"),
+			cfg.tls.internalServerCertFile,
+			cfg.tls.internalServerKeyFile,
+			cfg.tls.minVersion,
+			cfg.tls.cipherSuites,
+		)
+		if err != nil {
+			stdlog.Fatalf("failed to initialize tls config: %v", err)
+		}
+
+		if internalTLSConfig != nil {
+			r, err := rbacproxytls.NewCertReloader(
+				cfg.tls.internalServerCertFile,
+				cfg.tls.internalServerKeyFile,
+				cfg.tls.reloadInterval,
+			)
+			if err != nil {
+				stdlog.Fatalf("failed to initialize certificate reloader: %v", err)
+			}
+
+			internalTLSConfig.GetCertificate = r.GetCertificate
+
+			ctx, cancel := context.WithCancel(context.Background())
+			g.Add(func() error {
+				return r.Watch(ctx)
+			}, func(error) {
+				cancel()
+			})
+		}
+
 		s := http.Server{
-			Addr:    cfg.server.listenInternal,
-			Handler: h,
+			Addr:         cfg.server.listenInternal,
+			Handler:      h,
+			TLSConfig:    internalTLSConfig,
+			ReadTimeout:  readTimeout,  // best set per handler.
+			WriteTimeout: writeTimeout, // best set per handler.
 		}
 
 		g.Add(func() error {
 			level.Info(logger).Log("msg", "starting internal HTTP server", "address", s.Addr)
+
+			if internalTLSConfig != nil {
+				// internalServerCertFile and internalServerKeyFile passed in TLSConfig at initialization.
+				return s.ListenAndServeTLS("", "")
+			}
+
 			return s.ListenAndServe()
 		}, func(err error) {
 			_ = s.Shutdown(context.Background())
@@ -686,6 +755,7 @@ func parseFlags() (config, error) {
 		rawTLSCipherSuites      string
 		rawMetricsReadEndpoint  string
 		rawMetricsWriteEndpoint string
+		rawMetricsRulesEndpoint string
 		rawLogsReadEndpoint     string
 		rawLogsTailEndpoint     string
 		rawLogsWriteEndpoint    string
@@ -726,6 +796,8 @@ func parseFlags() (config, error) {
 		"The endpoint against which to make tail read requests for logs.")
 	flag.StringVar(&rawLogsReadEndpoint, "logs.read.endpoint", "",
 		"The endpoint against which to make read requests for logs.")
+	flag.StringVar(&cfg.logs.upstreamCAFile, "logs.tls.ca-file", "",
+		"File containing the TLS CA against which to upstream logs servers. Leave blank to disable TLS.")
 	flag.StringVar(&cfg.logs.tenantHeader, "logs.tenant-header", "X-Scope-OrgID",
 		"The name of the HTTP header containing the tenant ID to forward to the logs upstream.")
 	flag.StringVar(&rawLogsWriteEndpoint, "logs.write.endpoint", "",
@@ -734,6 +806,10 @@ func parseFlags() (config, error) {
 		"The endpoint against which to send read requests for metrics. It used as a fallback to 'query.endpoint' and 'query-range.endpoint'.")
 	flag.StringVar(&rawMetricsWriteEndpoint, "metrics.write.endpoint", "",
 		"The endpoint against which to make write requests for metrics.")
+	flag.StringVar(&rawMetricsRulesEndpoint, "metrics.rules.endpoint", "",
+		"The endpoint against which to make get requests for listing recording/alerting rules and put requests for creating/updating recording/alerting rules.")
+	flag.StringVar(&cfg.metrics.upstreamCAFile, "metrics.tls.ca-file", "",
+		"File containing the TLS CA against which to upstream metrics servers. Leave blank to disable TLS.")
 	flag.StringVar(&cfg.metrics.tenantHeader, "metrics.tenant-header", "THANOS-TENANT",
 		"The name of the HTTP header containing the tenant ID to forward to the metrics upstreams.")
 	flag.StringVar(&cfg.metrics.tenantLabel, "metrics.tenant-label", "tenant_id",
@@ -742,6 +818,10 @@ func parseFlags() (config, error) {
 		"File containing the default x509 Certificate for HTTPS. Leave blank to disable TLS.")
 	flag.StringVar(&cfg.tls.serverKeyFile, "tls.server.key-file", "",
 		"File containing the default x509 private key matching --tls.server.cert-file. Leave blank to disable TLS.")
+	flag.StringVar(&cfg.tls.internalServerCertFile, "tls.internal.server.cert-file", "",
+		"File containing the default x509 Certificate for internal HTTPS. Leave blank to disable TLS.")
+	flag.StringVar(&cfg.tls.internalServerKeyFile, "tls.internal.server.key-file", "",
+		"File containing the default x509 private key matching --tls.internal.server.cert-file. Leave blank to disable TLS.")
 	flag.StringVar(&cfg.tls.healthchecksServerCAFile, "tls.healthchecks.server-ca-file", "",
 		"File containing the TLS CA against which to verify servers."+
 			" If no server CA is specified, the client will use the system certificates.")
@@ -766,23 +846,41 @@ func parseFlags() (config, error) {
 		"The number of concurrent requests that can buffered.")
 	flag.DurationVar(&cfg.middleware.backLogDurationConcurrentRequests, "middleware.backlog-duration-concurrent-requests", 1*time.Millisecond,
 		"The time duration to buffer up concurrent requests.")
-	flag.StringVar(&cfg.database.dsn, "database.dsn", "",
-		"This is the DataSourceName used to connect to a Postgres database.")
+
 	flag.Parse()
 
-	metricsReadEndpoint, err := url.ParseRequestURI(rawMetricsReadEndpoint)
-	if err != nil {
-		return cfg, fmt.Errorf("--metrics.read.endpoint %q is invalid: %w", rawMetricsReadEndpoint, err)
+	if rawMetricsReadEndpoint != "" {
+		cfg.metrics.enabled = true
+
+		metricsReadEndpoint, err := url.ParseRequestURI(rawMetricsReadEndpoint)
+		if err != nil {
+			return cfg, fmt.Errorf("--metrics.read.endpoint %q is invalid: %w", rawMetricsReadEndpoint, err)
+		}
+
+		cfg.metrics.readEndpoint = metricsReadEndpoint
 	}
 
-	cfg.metrics.readEndpoint = metricsReadEndpoint
+	if rawMetricsWriteEndpoint != "" {
+		cfg.metrics.enabled = true
 
-	metricsWriteEndpoint, err := url.ParseRequestURI(rawMetricsWriteEndpoint)
-	if err != nil {
-		return cfg, fmt.Errorf("--metrics.write.endpoint %q is invalid: %w", rawMetricsWriteEndpoint, err)
+		metricsWriteEndpoint, err := url.ParseRequestURI(rawMetricsWriteEndpoint)
+		if err != nil {
+			return cfg, fmt.Errorf("--metrics.write.endpoint %q is invalid: %w", rawMetricsWriteEndpoint, err)
+		}
+
+		cfg.metrics.writeEndpoint = metricsWriteEndpoint
 	}
 
-	cfg.metrics.writeEndpoint = metricsWriteEndpoint
+	if rawMetricsRulesEndpoint != "" {
+		cfg.metrics.enabled = true
+
+		metricsRulesEndpoint, err := url.ParseRequestURI(rawMetricsRulesEndpoint)
+		if err != nil {
+			return cfg, fmt.Errorf("--metrics.rules.endpoint %q is invalid: %w", rawMetricsRulesEndpoint, err)
+		}
+
+		cfg.metrics.rulesEndpoint = metricsRulesEndpoint
+	}
 
 	if rawLogsReadEndpoint != "" {
 		cfg.logs.enabled = true
@@ -837,6 +935,36 @@ func stripTenantPrefix(prefix string, next http.Handler) http.Handler {
 		tenantPrefix := path.Join("/", prefix, tenant)
 		http.StripPrefix(tenantPrefix, proxy.WithPrefix(tenantPrefix, next)).ServeHTTP(w, r)
 	})
+}
+
+func unmarshalLegacyAuthenticatorConfig(v interface{}) (map[string]interface{}, error) {
+	jsonBytes, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	var config map[string]interface{}
+
+	if err := json.Unmarshal(jsonBytes, &config); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+func tenantAuthenticatorConfig(t *tenant) (map[string]interface{}, string, error) {
+	switch {
+	case t.OIDC != nil:
+		return t.OIDC.config, authentication.OIDCAuthenticatorType, nil
+	case t.OpenShift != nil:
+		return t.OpenShift.config, authentication.OpenShiftAuthenticatorType, nil
+	case t.MTLS != nil:
+		return t.MTLS.config, authentication.MTLSAuthenticatorType, nil
+	case t.Authenticator != nil:
+		return t.Authenticator.Config, t.Authenticator.Type, nil
+	default:
+		return nil, "", fmt.Errorf("tenant %q must specify either an OIDC, mTLS, openshift or a supported authenticator configuration", t.Name)
+	}
 }
 
 type otelErrorHandler struct {
