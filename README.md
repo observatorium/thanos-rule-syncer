@@ -17,7 +17,7 @@ Usage of ./thanos-rule-syncer:
   -interval uint
     	The interval at which to poll the Observatorium API for updates to rules, given in seconds. (default 60)
   -observatorium-api-url string
-    	The URL of the Observatorium API from where to fetch the rules. This should be the full ULR including the path to the tenant's rules.
+    	The URL of the Observatorium API from which to fetch the rules.
   -observatorium-ca string
     	Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.
   -oidc.audience string
@@ -28,6 +28,8 @@ Usage of ./thanos-rule-syncer:
     	The OIDC client secret, see https://tools.ietf.org/html/rfc6749#section-2.3.
   -oidc.issuer-url string
     	The OIDC issuer URL, see https://openid.net/specs/openid-connect-discovery-1_0.html#IssuerDiscovery.
+  -tenant string
+    	The name of the tenant whose rules should be synced.
   -thanos-rule-url string
     	The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload.
 ```
