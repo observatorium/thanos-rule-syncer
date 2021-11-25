@@ -49,15 +49,20 @@ token=$(curl \
     --data scope="openid" | sed 's/^{.*"access_token":[^"]*"\([^"]*\)".*}/\1/')
 
 (
- observatorium \
-   --web.listen=0.0.0.0:8443 \
-   --web.internal.listen=0.0.0.0:8448 \
-   --web.healthchecks.url=http://127.0.0.1:8443 \
-   --metrics.read.endpoint=http://127.0.0.1:9091 \
-   --metrics.write.endpoint=http://127.0.0.1:19291 \
-   --rbac.config=./test/config/rbac.yaml \
-   --tenants.config=./test/config/tenants.yaml \
-   --log.level=debug
+  observatorium \
+    --web.listen=0.0.0.0:8443 \
+    --web.internal.listen=0.0.0.0:8448 \
+    --web.healthchecks.url=http://127.0.0.1:8443 \
+    --metrics.read.endpoint=http://127.0.0.1:9091 \
+    --metrics.write.endpoint=http://127.0.0.1:19291 \
+    --rbac.config=./test/config/rbac.yaml \
+    --tenants.config=./test/config/tenants.yaml \
+    --log.level=debug \
+    --metrics.rules.endpoint=http://127.0.0.1:8080
+) &
+
+(
+  { echo -ne "HTTP/1.0 200 OK\r\nContent-Length: $(wc -c < test/config/rules.yaml)\r\nContent-Type: yaml\r\n\r\n"; cat  test/config/rules.yaml; } | nc -Nlp 8080
 ) &
 
 tmp=$(mktemp -d)
@@ -88,8 +93,8 @@ echo "-------------------------------------------"
 
 (
   ./thanos-rule-syncer \
-    --interval=2 \
-    --observatorium-api-url=http://localhost:8443/api/metrics/v1/test-oidc/rules \
+    --observatorium-api-url=http://localhost:8443 \
+    --tenant=test-oidc \
     --thanos-rule-url=http://localhost:10902 \
     --file="$tmp"/rules.yaml \
     --oidc.issuer-url=http://localhost:4444/ \
