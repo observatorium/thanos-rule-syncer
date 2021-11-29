@@ -117,18 +117,28 @@ echo "-------------------------------------------"
 echo "- Rules File tests                        -"
 echo "-------------------------------------------"
 
-query="$(curl \
-    --fail \
-    'http://127.0.0.1:8443/api/metrics/v1/test-oidc/api/v1/query?query=trs' \
-    -H "Authorization: bearer $token")"
+i=0
+while [ "$i" -lt 10 ]; do
+  query="$(curl \
+      --fail \
+      'http://127.0.0.1:8443/api/metrics/v1/test-oidc/api/v1/query?query=trs' \
+      -H "Authorization: bearer $token")"
+  
+  if [[ "$query" == *'"result":[{"metric":{"__name__":"trs","tenant_id":"1610b0c3-c509-4592-a256-a1871353dbfa"}'* ]]; then
+    result=0
+    break
+  else
+    result=1
+    ((i=i+1))
+    sleep 5
+  fi
+done
 
-if [[ "$query" == *'"result":[{"metric":{"__name__":"trs","tenant_id":"1610b0c3-c509-4592-a256-a1871353dbfa"}'* ]]; then
-  result=0
+if [ "$result" -eq 0 ]; then
   echo "-------------------------------------------"
   echo "- Rules File: OK                          -"
   echo "-------------------------------------------"
 else
-  result=1
   echo "-------------------------------------------"
   echo "- Rules File: FAILED                      -"
   echo "-------------------------------------------"
