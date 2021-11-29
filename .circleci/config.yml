@@ -24,7 +24,7 @@ jobs:
     steps:
       - checkout
       - run: |
-          apt-get update && apt-get -y install xz-utils unzip openssl
+          apt-get update && apt-get -y install xz-utils unzip openssl netcat-openbsd
           make test --always-make
 
   generate:
