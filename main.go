@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -14,43 +15,54 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc"
+	"github.com/ghodss/yaml"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 )
 
+const (
+	fetchConcurrency int = 5
+)
+
 type config struct {
-	observatoriumURL string
-	observatoriumCA  string
-	thanosRuleURL    string
-	file             string
-	tenant           string
-	oidc             oidcConfig
-	interval         uint
+	observatoriumURL  string
+	observatoriumCA   string
+	thanosRuleURL     string
+	file              string
+	tenantsConfigFile string
+	interval          uint
+}
+
+type tenantsConfig struct {
+	Tenants []tenant `json:"tenants"`
+}
+
+type tenant struct {
+	Name   string     `json:"name"`
+	OIDC   oidcConfig `json:"oidc"`
+	client *http.Client
 }
 
 type oidcConfig struct {
-	audience     string
-	clientID     string
-	clientSecret string
-	issuerURL    string
+	Audience     string `json:"audience"`
+	ClientID     string `json:"clientID"`
+	ClientSecret string `json:"clientSecret"`
+	IssuerURL    string `json:"issuerURL"`
 }
 
 func parseFlags() *config {
 	cfg := &config{}
 	flag.StringVar(&cfg.observatoriumURL, "observatorium-api-url", "", "The URL of the Observatorium API from which to fetch the rules.")
-	flag.StringVar(&cfg.tenant, "tenant", "", "The name of the tenant whose rules should be synced.")
+	flag.StringVar(&cfg.tenantsConfigFile, "tenants.config-file", "", "The path to the file containing all tenants to sync rules for.")
 	flag.StringVar(&cfg.observatoriumCA, "observatorium-ca", "", "Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.")
 	flag.StringVar(&cfg.thanosRuleURL, "thanos-rule-url", "", "The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload.")
 	flag.StringVar(&cfg.file, "file", "", "The path to the file the rules are written to on disk so that Thanos Ruler can read it from.")
-	flag.StringVar(&cfg.oidc.issuerURL, "oidc.issuer-url", "", "The OIDC issuer URL, see https://openid.net/specs/openid-connect-discovery-1_0.html#IssuerDiscovery.")
-	flag.StringVar(&cfg.oidc.clientSecret, "oidc.client-secret", "", "The OIDC client secret, see https://tools.ietf.org/html/rfc6749#section-2.3.")
-	flag.StringVar(&cfg.oidc.clientID, "oidc.client-id", "", "The OIDC client ID, see https://tools.ietf.org/html/rfc6749#section-2.3.")
-	flag.StringVar(&cfg.oidc.audience, "oidc.audience", "", "The audience for whom the access token is intended, see https://openid.net/specs/openid-connect-core-1_0.html#IDToken.")
 	flag.UintVar(&cfg.interval, "interval", 60, "The interval at which to poll the Observatorium API for updates to rules, given in seconds.")
 
 	flag.Parse()
@@ -79,49 +91,62 @@ func main() {
 		}
 	}
 
-	if cfg.oidc.issuerURL != "" {
-		provider, err := oidc.NewProvider(context.Background(), cfg.oidc.issuerURL)
+	var tenantsCfg tenantsConfig
+	{
+		tenantsRaw, err := ioutil.ReadFile(cfg.tenantsConfigFile)
 		if err != nil {
-			log.Fatalf("OIDC provider initialization failed: %v", err)
-		}
-		ctx = context.WithValue(ctx, oauth2.HTTPClient, http.Client{
-			Transport: newRoundTripperInstrumenter(registry).NewRoundTripper("oauth", http.DefaultTransport),
-		})
-		ccc := clientcredentials.Config{
-			ClientID:     cfg.oidc.clientID,
-			ClientSecret: cfg.oidc.clientSecret,
-			TokenURL:     provider.Endpoint().TokenURL,
-		}
-		if cfg.oidc.audience != "" {
-			ccc.EndpointParams = url.Values{
-				"audience": []string{cfg.oidc.audience},
-			}
-		}
-		client = &http.Client{
-			Transport: &oauth2.Transport{
-				Base:   t,
-				Source: ccc.TokenSource(ctx),
-			},
+			log.Fatalf("failed to read tenants config file: %v", err)
 		}
 
+		if err := yaml.Unmarshal(tenantsRaw, &tenantsCfg); err != nil {
+			log.Fatalf("failed to parse tenants config file: %v", err)
+		}
+	}
+
+	ins := newRoundTripperInstrumenter(registry)
+
+	for i, tenant := range tenantsCfg.Tenants {
+		if tenant.OIDC.IssuerURL != "" {
+			provider, err := oidc.NewProvider(context.Background(), tenant.OIDC.IssuerURL)
+			if err != nil {
+				log.Fatalf("OIDC provider initialization failed: %v", err)
+			}
+			ctxo := context.WithValue(ctx, oauth2.HTTPClient, http.Client{
+				Transport: ins.NewRoundTripper("oauth", tenant.Name, http.DefaultTransport),
+			})
+			ccc := clientcredentials.Config{
+				ClientID:     tenant.OIDC.ClientID,
+				ClientSecret: tenant.OIDC.ClientSecret,
+				TokenURL:     provider.Endpoint().TokenURL,
+			}
+			if tenant.OIDC.Audience != "" {
+				ccc.EndpointParams = url.Values{
+					"audience": []string{tenant.OIDC.Audience},
+				}
+			}
+			tenantsCfg.Tenants[i].client = &http.Client{
+				Transport: &oauth2.Transport{
+					Base:   t,
+					Source: ccc.TokenSource(ctxo),
+				},
+			}
+		}
 	}
 
 	u, err := url.Parse(cfg.observatoriumURL)
 	if err != nil {
 		log.Fatalf("failed to parse Observatorium API URL: %v", err)
 	}
-	u.Path = path.Join("/api/metrics/v1", cfg.tenant, "/api/v1/rules/raw")
 
 	var gr run.Group
 	gr.Add(run.SignalHandler(ctx, os.Interrupt))
 
 	gr.Add(func() error {
 		fn := func(ctx context.Context) error {
-			rules, err := getRules(ctx, client, u.String())
+			rules, err := getRulesForTenants(ctx, *u, tenantsCfg.Tenants)
 			if err != nil {
 				return fmt.Errorf("failed to get rules from url: %v\n", err)
 			}
-			defer rules.Close()
 			file, err := os.Create(cfg.file)
 			if err != nil {
 				return fmt.Errorf("failed to create or open the rules file %s: %v", cfg.file, err)
@@ -161,6 +186,53 @@ func main() {
 	}
 }
 
+func getRulesForTenants(ctx context.Context, observatoriumURL url.URL, tenants []tenant) (io.Reader, error) {
+	queue := make(chan tenant)
+	respc := make(chan []byte)
+
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(len(tenants))
+
+		for i := 0; i < fetchConcurrency; i++ {
+			go func() {
+				for tenant := range queue {
+					observatoriumURL.Path = path.Join("/api/metrics/v1", tenant.Name, "/api/v1/rules/raw")
+					// TODO(onprem): Handle errors.
+					rules, _ := getRules(ctx, tenant.client, observatoriumURL.String())
+					defer rules.Close()
+
+					raw, _ := ioutil.ReadAll(rules)
+
+					respc <- raw
+					wg.Done()
+				}
+			}()
+		}
+		wg.Wait()
+		close(respc)
+	}()
+
+	go func() {
+		for _, tenant := range tenants {
+			queue <- tenant
+		}
+		close(queue)
+	}()
+
+	var rules []byte
+
+	for res := range respc {
+		merged, err := mergePromRules(rules, res)
+		if err != nil {
+			continue
+		}
+		rules = merged
+	}
+
+	return bytes.NewReader(rules), nil
+}
+
 func getRules(ctx context.Context, client *http.Client, url string) (io.ReadCloser, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -195,4 +267,23 @@ func reloadThanosRule(ctx context.Context, client *http.Client, url string) erro
 	}
 
 	return nil
+}
+
+// merePromRules merges two Prometheus rules files into one.
+func mergePromRules(aRaw, bRaw []byte) ([]byte, error) {
+	var a, b struct {
+		Groups []interface{} `json:"groups"`
+	}
+
+	if err := yaml.Unmarshal(aRaw, &a); err != nil {
+		return nil, err
+	}
+
+	if err := yaml.Unmarshal(bRaw, &b); err != nil {
+		return nil, err
+	}
+
+	a.Groups = append(a.Groups, b.Groups...)
+
+	return yaml.Marshal(a)
 }

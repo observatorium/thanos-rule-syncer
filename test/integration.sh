@@ -94,13 +94,9 @@ echo "-------------------------------------------"
 (
   ./thanos-rule-syncer \
     --observatorium-api-url=http://localhost:8443 \
-    --tenant=test-oidc \
     --thanos-rule-url=http://localhost:10902 \
     --file="$tmp"/rules.yaml \
-    --oidc.issuer-url=http://localhost:4444/ \
-    --oidc.client-id=thanos-rule-syncer \
-    --oidc.client-secret=secret \
-    --oidc.audience=observatorium
+    --tenants.config-file=./test/config/syncer-tenants.yaml
 ) &
 
 echo "-------------------------------------------"

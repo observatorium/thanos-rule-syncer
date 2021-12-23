@@ -1,0 +1,7 @@
+tenants:
+- name: test-oidc
+  oidc:
+    clientID: thanos-rule-syncer
+    clientSecret: secret
+    audience: observatorium
+    issuerURL: http://localhost:4444/

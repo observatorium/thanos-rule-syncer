@@ -34,6 +34,7 @@ github.com/efficientgo/tools/core/pkg/merrors
 # github.com/felixge/httpsnoop v1.0.1
 github.com/felixge/httpsnoop
 # github.com/ghodss/yaml v1.0.0
+## explicit
 github.com/ghodss/yaml
 # github.com/go-chi/chi v4.1.0+incompatible
 github.com/go-chi/chi

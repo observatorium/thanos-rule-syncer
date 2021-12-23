@@ -19,7 +19,7 @@ func newRoundTripperInstrumenter(r prometheus.Registerer) *roundTripperInstrumen
 				Name: "client_api_requests_total",
 				Help: "A counter for requests from the wrapped client.",
 			},
-			[]string{"code", "method", "client"},
+			[]string{"code", "method", "client", "tenant"},
 		),
 		requestDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -27,7 +27,7 @@ func newRoundTripperInstrumenter(r prometheus.Registerer) *roundTripperInstrumen
 				Help:    "A histogram of request latencies.",
 				Buckets: prometheus.DefBuckets,
 			},
-			[]string{"method", "client"},
+			[]string{"method", "client", "tenant"},
 		),
 	}
 
@@ -42,9 +42,9 @@ func newRoundTripperInstrumenter(r prometheus.Registerer) *roundTripperInstrumen
 }
 
 // NewRoundTripper wraps a HTTP RoundTripper with some metrics.
-func (i *roundTripperInstrumenter) NewRoundTripper(name string, rt http.RoundTripper) http.RoundTripper {
-	counter := i.requestCounter.MustCurryWith(prometheus.Labels{"client": name})
-	duration := i.requestDuration.MustCurryWith(prometheus.Labels{"client": name})
+func (i *roundTripperInstrumenter) NewRoundTripper(name string, tenant string, rt http.RoundTripper) http.RoundTripper {
+	counter := i.requestCounter.MustCurryWith(prometheus.Labels{"client": name, "tenant": tenant})
+	duration := i.requestDuration.MustCurryWith(prometheus.Labels{"client": name, "tenant": tenant})
 
 	return promhttp.InstrumentRoundTripperCounter(counter,
 		promhttp.InstrumentRoundTripperDuration(duration, rt),
