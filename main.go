@@ -24,6 +24,7 @@ import (
 )
 
 type config struct {
+	rulesBackendURL  string
 	observatoriumURL string
 	observatoriumCA  string
 	thanosRuleURL    string
@@ -42,6 +43,7 @@ type oidcConfig struct {
 
 func parseFlags() *config {
 	cfg := &config{}
+	flag.StringVar(&cfg.rulesBackendURL, "rules-backend-url", "", "The URL of the Rules Storage Backend from which to fetch the rules. If specified, it gets priority over -observatorium-api-url.")
 	flag.StringVar(&cfg.observatoriumURL, "observatorium-api-url", "", "The URL of the Observatorium API from which to fetch the rules.")
 	flag.StringVar(&cfg.tenant, "tenant", "", "The name of the tenant whose rules should be synced.")
 	flag.StringVar(&cfg.observatoriumCA, "observatorium-ca", "", "Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.")
@@ -103,14 +105,25 @@ func main() {
 				Source: ccc.TokenSource(ctx),
 			},
 		}
-
 	}
 
-	u, err := url.Parse(cfg.observatoriumURL)
-	if err != nil {
-		log.Fatalf("failed to parse Observatorium API URL: %v", err)
+	var u *url.URL
+
+	if cfg.rulesBackendURL != "" {
+		u, err := url.Parse(cfg.rulesBackendURL)
+		if err != nil {
+			log.Fatalf("failed to parse Rules Backend URL: %v", err)
+		}
+
+		u.Path = "/api/v1/rules"
+	} else {
+		u, err := url.Parse(cfg.observatoriumURL)
+		if err != nil {
+			log.Fatalf("failed to parse Observatorium API URL: %v", err)
+		}
+
+		u.Path = path.Join("/api/metrics/v1", cfg.tenant, "/api/v1/rules/raw")
 	}
-	u.Path = path.Join("/api/metrics/v1", cfg.tenant, "/api/v1/rules/raw")
 
 	var gr run.Group
 	gr.Add(run.SignalHandler(ctx, os.Interrupt))
@@ -173,7 +186,7 @@ func getRules(ctx context.Context, client *http.Client, url string) (io.ReadClos
 		return nil, fmt.Errorf("failed to do http request: %w", err)
 	}
 	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("got unexpected status from Observatorium API: %d", res.StatusCode)
+		return nil, fmt.Errorf("got unexpected status from API: %d", res.StatusCode)
 	}
 
 	return res.Body, nil
