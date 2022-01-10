@@ -7,13 +7,11 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"time"
 
 	"github.com/coreos/go-oidc"
@@ -107,22 +105,20 @@ func main() {
 		}
 	}
 
-	var u *url.URL
+	var f fetcher
 
 	if cfg.rulesBackendURL != "" {
-		u, err := url.Parse(cfg.rulesBackendURL)
+		rulesFetcher, err := newRulesBackendFetcher(cfg.rulesBackendURL, client)
 		if err != nil {
-			log.Fatalf("failed to parse Rules Backend URL: %v", err)
+			log.Fatalf("failed to initialize Rules Backend fetcher: %v", err)
 		}
-
-		u.Path = "/api/v1/rules"
+		f = rulesFetcher
 	} else {
-		u, err := url.Parse(cfg.observatoriumURL)
+		obsFetcher, err := newObservatoruimAPIFetcher(cfg.observatoriumURL, cfg.tenant, client)
 		if err != nil {
-			log.Fatalf("failed to parse Observatorium API URL: %v", err)
+			log.Fatalf("failed to initialize Observatorium API fetcher: %v", err)
 		}
-
-		u.Path = path.Join("/api/metrics/v1", cfg.tenant, "/api/v1/rules/raw")
+		f = obsFetcher
 	}
 
 	var gr run.Group
@@ -130,7 +126,7 @@ func main() {
 
 	gr.Add(func() error {
 		fn := func(ctx context.Context) error {
-			rules, err := getRules(ctx, client, u.String())
+			rules, err := f.getRules(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to get rules from url: %v\n", err)
 			}
@@ -172,24 +168,6 @@ func main() {
 	if err := gr.Run(); err != nil {
 		log.Fatalf("thanos-rule-syncer quit unexpectectly: %v", err)
 	}
-}
-
-func getRules(ctx context.Context, client *http.Client, url string) (io.ReadCloser, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req = req.WithContext(ctx)
-
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to do http request: %w", err)
-	}
-	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("got unexpected status from API: %d", res.StatusCode)
-	}
-
-	return res.Body, nil
 }
 
 func reloadThanosRule(ctx context.Context, client *http.Client, url string) error {
