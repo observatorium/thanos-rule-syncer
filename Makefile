@@ -31,16 +31,12 @@ tmp/help.txt: thanos-rule-syncer
 README.md: $(EMBEDMD) tmp/help.txt
 	$(EMBEDMD) -w README.md
 
-thanos-rule-syncer: vendor main.go $(wildcard *.go) $(wildcard */*.go)
-	CGO_ENABLED=0 GOOS=$(OS) GOARCH=amd64 GO111MODULE=on GOPROXY=https://proxy.golang.org go build -mod vendor -a -ldflags '-s -w' -o $@ .
+thanos-rule-syncer: main.go $(wildcard *.go) $(wildcard */*.go)
+	go mod tidy
+	CGO_ENABLED=0 GOOS=$(OS) GOARCH=amd64 GO111MODULE=on GOPROXY=https://proxy.golang.org go build -mod mod -a -ldflags '-s -w' -o $@ .
 
 .PHONY: build
 build: thanos-rule-syncer
-
-.PHONY: vendor
-vendor: go.mod go.sum
-	go mod tidy
-	go mod vendor
 
 .PHONY: format
 format: $(GOLANGCILINT)
@@ -48,14 +44,14 @@ format: $(GOLANGCILINT)
 
 .PHONY: go-fmt
 go-fmt:
-	@fmt_res=$$(gofmt -d -s $$(find . -type f -name '*.go' -not -path './vendor/*' -not -path './jsonnet/vendor/*' -not -path '${TMP_DIR}/*')); if [ -n "$$fmt_res" ]; then printf '\nGofmt found style issues. Please check the reported issues\nand fix them if necessary before submitting the code for review:\n\n%s' "$$fmt_res"; exit 1; fi
+	@fmt_res=$$(gofmt -d -s $$(find . -type f -name '*.go' -not -path './jsonnet/vendor/*' -not -path '${TMP_DIR}/*')); if [ -n "$$fmt_res" ]; then printf '\nGofmt found style issues. Please check the reported issues\nand fix them if necessary before submitting the code for review:\n\n%s' "$$fmt_res"; exit 1; fi
 
 .PHONY: shellcheck
 shellcheck: $(SHELLCHECK)
-	$(SHELLCHECK) $(shell find . -type f -name "*.sh" -not -path "*vendor*" -not -path "${TMP_DIR}/*")
+	$(SHELLCHECK) $(shell find . -type f -name "*.sh" -not -path "${TMP_DIR}/*")
 
 .PHONY: lint
-lint: $(GOLANGCILINT) vendor go-fmt shellcheck
+lint: $(GOLANGCILINT) go-fmt shellcheck
 	$(GOLANGCILINT) run -v --enable-all -c .golangci.yml
 
 .PHONY: test
@@ -63,7 +59,7 @@ test: build test-unit test-integration
 
 .PHONY: test-unit
 test-unit:
-	CGO_ENABLED=1 GO111MODULE=on go test -mod vendor -v -race -short ./...
+	CGO_ENABLED=1 GO111MODULE=on go test -mod mod -v -race -short ./...
 
 .PHONY: test-integration
 test-integration: build integration-test-dependencies
@@ -111,15 +107,15 @@ $(THANOS): | $(BIN_DIR)
 	@echo "Downloading Thanos"
 	curl -L "https://github.com/thanos-io/thanos/releases/download/v$(THANOS_VERSION)/thanos-$(THANOS_VERSION).$$(go env GOOS)-$$(go env GOARCH).tar.gz" | tar --strip-components=1 -xzf - -C $(BIN_DIR)
 
-$(OBSERVATORIUM): | vendor $(BIN_DIR)
-	go build -mod=vendor -o $@ github.com/observatorium/api
+$(OBSERVATORIUM): | $(BIN_DIR)
+	go build -mod=mod -o $@ github.com/observatorium/api
 
-$(HYDRA): | vendor $(BIN_DIR)
+$(HYDRA): | $(BIN_DIR)
 	@echo "Downloading Hydra"
 	curl -L "https://github.com/ory/hydra/releases/download/v1.7.4/hydra_1.7.4_linux_64-bit.tar.gz" | tar -xzf - -C $(BIN_DIR) hydra
 
-$(EMBEDMD): | vendor $(BIN_DIR)
-	go build -mod=vendor -o $@ github.com/campoy/embedmd
+$(EMBEDMD): | $(BIN_DIR)
+	go build -mod=mod -o $@ github.com/campoy/embedmd
 
 $(GOLANGCILINT):
 	curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCILINT_VERSION)/install.sh \
