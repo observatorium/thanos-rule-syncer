@@ -21,7 +21,7 @@ type observatoriumAPIFetcher struct {
 	client   *http.Client
 }
 
-func newObservatoruimAPIFetcher(baseURL string, tenant string, client *http.Client) (*observatoriumAPIFetcher, error) {
+func newObservatoriumAPIFetcher(baseURL string, tenant string, client *http.Client) (*observatoriumAPIFetcher, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Observatorium API URL: %w", err)

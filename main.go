@@ -114,7 +114,7 @@ func main() {
 		}
 		f = rulesFetcher
 	} else {
-		obsFetcher, err := newObservatoruimAPIFetcher(cfg.observatoriumURL, cfg.tenant, client)
+		obsFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, client)
 		if err != nil {
 			log.Fatalf("failed to initialize Observatorium API fetcher: %v", err)
 		}
