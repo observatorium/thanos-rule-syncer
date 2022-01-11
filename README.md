@@ -28,6 +28,8 @@ Usage of ./thanos-rule-syncer:
     	The OIDC client secret, see https://tools.ietf.org/html/rfc6749#section-2.3.
   -oidc.issuer-url string
     	The OIDC issuer URL, see https://openid.net/specs/openid-connect-discovery-1_0.html#IssuerDiscovery.
+  -rules-backend-url string
+    	The URL of the Rules Storage Backend from which to fetch the rules. If specified, it gets priority over -observatorium-api-url.
   -tenant string
     	The name of the tenant whose rules should be synced.
   -thanos-rule-url string

@@ -7,13 +7,11 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"time"
 
 	"github.com/coreos/go-oidc"
@@ -24,6 +22,7 @@ import (
 )
 
 type config struct {
+	rulesBackendURL  string
 	observatoriumURL string
 	observatoriumCA  string
 	thanosRuleURL    string
@@ -42,6 +41,7 @@ type oidcConfig struct {
 
 func parseFlags() *config {
 	cfg := &config{}
+	flag.StringVar(&cfg.rulesBackendURL, "rules-backend-url", "", "The URL of the Rules Storage Backend from which to fetch the rules. If specified, it gets priority over -observatorium-api-url.")
 	flag.StringVar(&cfg.observatoriumURL, "observatorium-api-url", "", "The URL of the Observatorium API from which to fetch the rules.")
 	flag.StringVar(&cfg.tenant, "tenant", "", "The name of the tenant whose rules should be synced.")
 	flag.StringVar(&cfg.observatoriumCA, "observatorium-ca", "", "Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.")
@@ -103,21 +103,30 @@ func main() {
 				Source: ccc.TokenSource(ctx),
 			},
 		}
-
 	}
 
-	u, err := url.Parse(cfg.observatoriumURL)
-	if err != nil {
-		log.Fatalf("failed to parse Observatorium API URL: %v", err)
+	var f fetcher
+
+	if cfg.rulesBackendURL != "" {
+		rulesFetcher, err := newRulesBackendFetcher(cfg.rulesBackendURL, client)
+		if err != nil {
+			log.Fatalf("failed to initialize Rules Backend fetcher: %v", err)
+		}
+		f = rulesFetcher
+	} else {
+		obsFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, client)
+		if err != nil {
+			log.Fatalf("failed to initialize Observatorium API fetcher: %v", err)
+		}
+		f = obsFetcher
 	}
-	u.Path = path.Join("/api/metrics/v1", cfg.tenant, "/api/v1/rules/raw")
 
 	var gr run.Group
 	gr.Add(run.SignalHandler(ctx, os.Interrupt))
 
 	gr.Add(func() error {
 		fn := func(ctx context.Context) error {
-			rules, err := getRules(ctx, client, u.String())
+			rules, err := f.getRules(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to get rules from url: %v\n", err)
 			}
@@ -159,24 +168,6 @@ func main() {
 	if err := gr.Run(); err != nil {
 		log.Fatalf("thanos-rule-syncer quit unexpectectly: %v", err)
 	}
-}
-
-func getRules(ctx context.Context, client *http.Client, url string) (io.ReadCloser, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req = req.WithContext(ctx)
-
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to do http request: %w", err)
-	}
-	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("got unexpected status from Observatorium API: %d", res.StatusCode)
-	}
-
-	return res.Body, nil
 }
 
 func reloadThanosRule(ctx context.Context, client *http.Client, url string) error {
