@@ -13,11 +13,11 @@ At last the Thanos Ruler will be reloaded with a POST request against `$(--thano
 ```txt
 Usage of ./thanos-rule-syncer:
   -file string
-    	The path to the file the rules are written to on disk so that Thanos Ruler can read it from.
+    	The path to the file the rules are written to on disk so that Thanos Ruler can read it from. Required. (default "rules.yaml")
   -interval uint
     	The interval at which to poll the Observatorium API for updates to rules, given in seconds. (default 60)
   -observatorium-api-url string
-    	The URL of the Observatorium API from which to fetch the rules.
+    	The URL of the Observatorium API from which to fetch the rules. If specified, auth flags must also be provided.
   -observatorium-ca string
     	Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.
   -oidc.audience string
@@ -29,9 +29,9 @@ Usage of ./thanos-rule-syncer:
   -oidc.issuer-url string
     	The OIDC issuer URL, see https://openid.net/specs/openid-connect-discovery-1_0.html#IssuerDiscovery.
   -rules-backend-url string
-    	The URL of the Rules Storage Backend from which to fetch the rules. If specified, it gets priority over -observatorium-api-url.
+    	The URL of the Rules Storage Backend from which to fetch the rules. If specified, it gets priority over -observatorium-api-url and auth flags are no longer needed.
   -tenant string
     	The name of the tenant whose rules should be synced.
   -thanos-rule-url string
-    	The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload.
+    	The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload. Required.
 ```
