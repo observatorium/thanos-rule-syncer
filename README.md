@@ -7,7 +7,7 @@ It performs the following steps:
 
 1. It fetches the tenant's rules from the given `--observatorium-api-url` which should be the full URL including the path. If `--rules-backend-url` is specified, it gets
    priority over `--observatorium-api-url`.
-2. The rules are written to disk which should be the same folder that your Thanos Rule can read rules from.
+2. The rules are written to disk which should be the same folder that your Thanos Ruler can read rules from.
 3. Lastly, rules are synced with a POST request against `$(--thanos-rule-url)/-/reload`, reloading Thanos Ruler.
 
 ## Usage
