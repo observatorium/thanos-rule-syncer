@@ -71,8 +71,11 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t := http.DefaultTransport.(*http.Transport).Clone()
-	client := &http.Client{
-		Transport: roundTripperInst.NewRoundTripper("thanos-rule-syncer-http", t),
+	clientFetcher := &http.Client{
+		Transport: roundTripperInst.NewRoundTripper("fetch", t),
+	}
+	clientReloader := &http.Client{
+		Transport: roundTripperInst.NewRoundTripper("reload", t),
 	}
 
 	if cfg.observatoriumCA != "" {
@@ -106,7 +109,7 @@ func main() {
 				"audience": []string{cfg.oidc.audience},
 			}
 		}
-		client = &http.Client{
+		clientFetcher = &http.Client{
 			Transport: &oauth2.Transport{
 				Base:   t,
 				Source: ccc.TokenSource(ctx),
@@ -117,13 +120,13 @@ func main() {
 	var f fetcher
 
 	if cfg.rulesBackendURL != "" {
-		rulesFetcher, err := newRulesBackendFetcher(cfg.rulesBackendURL, client)
+		rulesFetcher, err := newRulesBackendFetcher(cfg.rulesBackendURL, clientFetcher)
 		if err != nil {
 			log.Fatalf("failed to initialize Rules Backend fetcher: %v", err)
 		}
 		f = rulesFetcher
 	} else {
-		obsFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, client)
+		obsFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, clientFetcher)
 		if err != nil {
 			log.Fatalf("failed to initialize Observatorium API fetcher: %v", err)
 		}
@@ -151,7 +154,7 @@ func main() {
 			if err := file.Close(); err != nil {
 				return fmt.Errorf("failed to close the rules file %s: %v", cfg.file, err)
 			}
-			if err := reloadThanosRule(ctx, client, cfg.thanosRuleURL); err != nil {
+			if err := reloadThanosRule(ctx, clientReloader, cfg.thanosRuleURL); err != nil {
 				return fmt.Errorf("failed to trigger thanos rule reload: %v", err)
 			}
 			return nil
