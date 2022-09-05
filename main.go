@@ -71,12 +71,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t := http.DefaultTransport.(*http.Transport).Clone()
-	clientFetcher := &http.Client{
-		Transport: roundTripperInst.NewRoundTripper("fetch", t),
-	}
-	clientReloader := &http.Client{
-		Transport: roundTripperInst.NewRoundTripper("reload", t),
-	}
 
 	if cfg.observatoriumCA != "" {
 		caFile, err := ioutil.ReadFile(cfg.observatoriumCA)
@@ -89,6 +83,13 @@ func main() {
 		t.TLSClientConfig = &tls.Config{
 			RootCAs: certPool,
 		}
+	}
+
+	clientFetcher := &http.Client{
+		Transport: roundTripperInst.NewRoundTripper("fetch", t),
+	}
+	clientReloader := &http.Client{
+		Transport: roundTripperInst.NewRoundTripper("reload", t),
 	}
 
 	if cfg.oidc.issuerURL != "" {
@@ -111,7 +112,7 @@ func main() {
 		}
 		clientFetcher = &http.Client{
 			Transport: &oauth2.Transport{
-				Base:   t,
+				Base:   clientFetcher.Transport,
 				Source: ccc.TokenSource(ctx),
 			},
 		}
