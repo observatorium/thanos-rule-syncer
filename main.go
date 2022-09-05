@@ -67,10 +67,13 @@ func main() {
 	cfg := parseFlags()
 
 	registry := prometheus.NewRegistry()
+	roundTripperInst := newRoundTripperInstrumenter(registry)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	client := &http.Client{}
+	ctx, cancel := context.WithCancel(context.Background()) // ADD to context
 	t := http.DefaultTransport.(*http.Transport).Clone()
+	client := &http.Client{
+		Transport: roundTripperInst.NewRoundTripper("thanos-rule-syncer-http", t),
+	}
 
 	if cfg.observatoriumCA != "" {
 		caFile, err := ioutil.ReadFile(cfg.observatoriumCA)
@@ -91,7 +94,7 @@ func main() {
 			log.Fatalf("OIDC provider initialization failed: %v", err)
 		}
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, http.Client{
-			Transport: newRoundTripperInstrumenter(registry).NewRoundTripper("oauth", http.DefaultTransport),
+			Transport: roundTripperInst.NewRoundTripper("oauth", http.DefaultTransport),
 		})
 		ccc := clientcredentials.Config{
 			ClientID:     cfg.oidc.clientID,
