@@ -69,7 +69,7 @@ func main() {
 	registry := prometheus.NewRegistry()
 	roundTripperInst := newRoundTripperInstrumenter(registry)
 
-	ctx, cancel := context.WithCancel(context.Background()) // ADD to context
+	ctx, cancel := context.WithCancel(context.Background())
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	client := &http.Client{
 		Transport: roundTripperInst.NewRoundTripper("thanos-rule-syncer-http", t),
