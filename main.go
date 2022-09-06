@@ -67,9 +67,9 @@ func main() {
 	cfg := parseFlags()
 
 	registry := prometheus.NewRegistry()
+	roundTripperInst := newRoundTripperInstrumenter(registry)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &http.Client{}
 	t := http.DefaultTransport.(*http.Transport).Clone()
 
 	if cfg.observatoriumCA != "" {
@@ -85,13 +85,20 @@ func main() {
 		}
 	}
 
+	clientFetcher := &http.Client{
+		Transport: roundTripperInst.NewRoundTripper("fetch", t),
+	}
+	clientReloader := &http.Client{
+		Transport: roundTripperInst.NewRoundTripper("reload", t),
+	}
+
 	if cfg.oidc.issuerURL != "" {
 		provider, err := oidc.NewProvider(context.Background(), cfg.oidc.issuerURL)
 		if err != nil {
 			log.Fatalf("OIDC provider initialization failed: %v", err)
 		}
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, http.Client{
-			Transport: newRoundTripperInstrumenter(registry).NewRoundTripper("oauth", http.DefaultTransport),
+			Transport: roundTripperInst.NewRoundTripper("oauth", http.DefaultTransport),
 		})
 		ccc := clientcredentials.Config{
 			ClientID:     cfg.oidc.clientID,
@@ -103,9 +110,9 @@ func main() {
 				"audience": []string{cfg.oidc.audience},
 			}
 		}
-		client = &http.Client{
+		clientFetcher = &http.Client{
 			Transport: &oauth2.Transport{
-				Base:   t,
+				Base:   clientFetcher.Transport,
 				Source: ccc.TokenSource(ctx),
 			},
 		}
@@ -114,13 +121,13 @@ func main() {
 	var f fetcher
 
 	if cfg.rulesBackendURL != "" {
-		rulesFetcher, err := newRulesBackendFetcher(cfg.rulesBackendURL, client)
+		rulesFetcher, err := newRulesBackendFetcher(cfg.rulesBackendURL, clientFetcher)
 		if err != nil {
 			log.Fatalf("failed to initialize Rules Backend fetcher: %v", err)
 		}
 		f = rulesFetcher
 	} else {
-		obsFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, client)
+		obsFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, clientFetcher)
 		if err != nil {
 			log.Fatalf("failed to initialize Observatorium API fetcher: %v", err)
 		}
@@ -148,7 +155,7 @@ func main() {
 			if err := file.Close(); err != nil {
 				return fmt.Errorf("failed to close the rules file %s: %v", cfg.file, err)
 			}
-			if err := reloadThanosRule(ctx, client, cfg.thanosRuleURL); err != nil {
+			if err := reloadThanosRule(ctx, clientReloader, cfg.thanosRuleURL); err != nil {
 				return fmt.Errorf("failed to trigger thanos rule reload: %v", err)
 			}
 			return nil
