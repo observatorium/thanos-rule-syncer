@@ -37,4 +37,6 @@ Usage of ./thanos-rule-syncer:
     	The name of the tenant whose rules should be synced.
   -thanos-rule-url string
     	The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload. Required.
+  -web.internal.listen string
+    	The address on which the internal server listens. (default ":8083")
 ```
