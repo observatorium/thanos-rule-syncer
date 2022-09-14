@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -15,8 +14,10 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
+	"github.com/metalmatze/signal/internalserver"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 )
@@ -30,6 +31,8 @@ type config struct {
 	tenant           string
 	oidc             oidcConfig
 	interval         uint
+
+	listenInternal string
 }
 
 type oidcConfig struct {
@@ -59,6 +62,8 @@ func parseFlags() *config {
 	flag.StringVar(&cfg.oidc.clientID, "oidc.client-id", "", "The OIDC client ID, see https://tools.ietf.org/html/rfc6749#section-2.3.")
 	flag.StringVar(&cfg.oidc.audience, "oidc.audience", "", "The audience for whom the access token is intended, see https://openid.net/specs/openid-connect-core-1_0.html#IDToken.")
 
+	flag.StringVar(&cfg.listenInternal, "web.internal.listen", ":8083", "The address on which the internal server listens.")
+
 	flag.Parse()
 	return cfg
 }
@@ -67,13 +72,19 @@ func main() {
 	cfg := parseFlags()
 
 	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		//nolint:exhaustivestruct
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
 	roundTripperInst := newRoundTripperInstrumenter(registry)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t := http.DefaultTransport.(*http.Transport).Clone()
 
 	if cfg.observatoriumCA != "" {
-		caFile, err := ioutil.ReadFile(cfg.observatoriumCA)
+		caFile, err := os.ReadFile(cfg.observatoriumCA)
 		if err != nil {
 			log.Fatalf("failed to read Observatorium CA file: %v", err)
 		}
@@ -141,7 +152,7 @@ func main() {
 		fn := func(ctx context.Context) error {
 			rules, err := f.getRules(ctx)
 			if err != nil {
-				return fmt.Errorf("failed to get rules from url: %v\n", err)
+				return fmt.Errorf("failed to get rules from url: %v", err)
 			}
 			defer rules.Close()
 			file, err := os.Create(cfg.file)
@@ -177,6 +188,28 @@ func main() {
 	}, func(err error) {
 		cancel()
 	})
+
+	{
+		h := internalserver.NewHandler(
+			internalserver.WithName("Internal - thanos-rule-syncer"),
+			internalserver.WithPrometheusRegistry(registry),
+			internalserver.WithPProf(),
+		)
+
+		//nolint:exhaustivestruct
+		s := http.Server{
+			Addr:    cfg.listenInternal,
+			Handler: h,
+		}
+
+		gr.Add(func() error {
+			log.Print("starting internal HTTP server at address: ", s.Addr)
+
+			return s.ListenAndServe() //nolint:wrapcheck
+		}, func(_ error) {
+			_ = s.Shutdown(context.Background())
+		})
+	}
 
 	if err := gr.Run(); err != nil {
 		log.Fatalf("thanos-rule-syncer quit unexpectectly: %v", err)
