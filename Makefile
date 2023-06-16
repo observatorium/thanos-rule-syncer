@@ -3,8 +3,8 @@ TMP_DIR := $(shell pwd)/tmp
 BIN_DIR ?= $(TMP_DIR)/bin
 LIB_DIR ?= $(TMP_DIR)/lib
 FIRST_GOPATH := $(firstword $(subst :, ,$(shell go env GOPATH)))
-OS ?= $(shell uname -s | tr '[A-Z]' '[a-z]')
-ARCH ?= $(shell uname -m)
+OS ?= $(shell go env GOOS)
+ARCH ?= $(shell go env GOARCH)
 
 VERSION := $(strip $(shell [ -d .git ] && git describe --always --tags --dirty))
 BUILD_DATE := $(shell date -u +"%Y-%m-%d")
@@ -33,7 +33,7 @@ README.md: $(EMBEDMD) tmp/help.txt
 
 thanos-rule-syncer: main.go $(wildcard *.go) $(wildcard */*.go)
 	go mod tidy
-	CGO_ENABLED=0 GOOS=$(OS) GOARCH=amd64 GO111MODULE=on GOPROXY=https://proxy.golang.org go build -mod mod -a -ldflags '-s -w' -o $@ .
+	CGO_ENABLED=0 GOOS=$(OS) GOARCH=$(ARCH) GO111MODULE=on GOPROXY=https://proxy.golang.org go build -mod mod -a -ldflags '-s -w' -o $@ .
 
 .PHONY: build
 build: thanos-rule-syncer
@@ -73,7 +73,8 @@ clean:
 
 .PHONY: container
 container: Dockerfile
-	@docker build --build-arg BUILD_DATE="$(BUILD_TIMESTAMP)" \
+	@docker build \
+		--build-arg BUILD_DATE="$(BUILD_TIMESTAMP)" \
 		--build-arg VERSION="$(VERSION)" \
 		--build-arg VCS_REF="$(VCS_REF)" \
 		--build-arg VCS_BRANCH="$(VCS_BRANCH)" \
@@ -81,18 +82,55 @@ container: Dockerfile
 		-t $(DOCKER_REPO):$(VCS_BRANCH)-$(BUILD_DATE)-$(VERSION) .
 	@docker tag $(DOCKER_REPO):$(VCS_BRANCH)-$(BUILD_DATE)-$(VERSION) $(DOCKER_REPO):latest
 
-.PHONY: container-push
-container-push: container
-	docker push $(DOCKER_REPO):$(VCS_BRANCH)-$(BUILD_DATE)-$(VERSION)
-	docker push $(DOCKER_REPO):latest
+.PHONY: container-build
+container-build:
+	docker buildx build \
+		--platform linux/amd64,linux/arm64 \
+		--cache-to type=local,dest=./.buildxcache/ \
+	    --build-arg BUILD_DATE="$(BUILD_TIMESTAMP)" \
+		--build-arg VERSION="$(VERSION)" \
+		--build-arg VCS_REF="$(VCS_REF)" \
+		--build-arg VCS_BRANCH="$(VCS_BRANCH)" \
+		--build-arg DOCKERFILE_PATH="/Dockerfile" \
+		-t $(DOCKER_REPO):$(VCS_BRANCH)-$(BUILD_DATE)-$(VERSION) \
+		-t $(DOCKER_REPO):latest \
+		.
 
-.PHONY: container-release
-container-release: VERSION_TAG = $(strip $(shell [ -d .git ] && git tag --points-at HEAD))
-container-release: container
+.PHONY: container-build-push
+container-build-push:
+	docker buildx build \
+		--push \
+		--platform linux/amd64,linux/arm64 \
+		--cache-to type=local,dest=./.buildxcache/ \
+	    --build-arg BUILD_DATE="$(BUILD_TIMESTAMP)" \
+		--build-arg VERSION="$(VERSION)" \
+		--build-arg VCS_REF="$(VCS_REF)" \
+		--build-arg VCS_BRANCH="$(VCS_BRANCH)" \
+		--build-arg DOCKERFILE_PATH="/Dockerfile" \
+		-t $(DOCKER_REPO):$(VCS_BRANCH)-$(BUILD_DATE)-$(VERSION) \
+		-t $(DOCKER_REPO):latest \
+		.
+
+.PHONY: conditional-container-build-push
+conditional-container-build-push:
+	build/conditional-container-push.sh $(DOCKER_REPO):$(VCS_BRANCH)-$(BUILD_DATE)-$(VERSION)
+
+.PHONY: container-release-build-push
+container-release-build-push: VERSION_TAG = $(strip $(shell [ -d .git ] && git tag --points-at HEAD))
+container-release-build-push: container-build-push
 	# https://git-scm.com/docs/git-tag#Documentation/git-tag.txt---points-atltobjectgt
-	@docker tag $(DOCKER_REPO):$(VCS_BRANCH)-$(BUILD_DATE)-$(VERSION) $(DOCKER_REPO):$(VERSION_TAG)
-	docker push $(DOCKER_REPO):$(VERSION_TAG)
-	docker push $(DOCKER_REPO):latest
+	@docker buildx build \
+		--push \
+		--platform linux/amd64,linux/arm64 \
+		--cache-from type=local,src=./.buildxcache/ \
+	    --build-arg BUILD_DATE="$(BUILD_TIMESTAMP)" \
+		--build-arg VERSION="$(VERSION)" \
+		--build-arg VCS_REF="$(VCS_REF)" \
+		--build-arg VCS_BRANCH="$(VCS_BRANCH)" \
+		--build-arg DOCKERFILE_PATH="/Dockerfile" \
+		-t $(DOCKER_REPO):$(VERSION_TAG) \
+		-t $(DOCKER_REPO):latest \
+		.
 
 .PHONY: integration-test-dependencies
 integration-test-dependencies: $(THANOS) $(HYDRA) $(OBSERVATORIUM)
@@ -105,7 +143,7 @@ $(LIB_DIR):
 
 $(THANOS): | $(BIN_DIR)
 	@echo "Downloading Thanos"
-	curl -L "https://github.com/thanos-io/thanos/releases/download/v$(THANOS_VERSION)/thanos-$(THANOS_VERSION).$$(go env GOOS)-$$(go env GOARCH).tar.gz" | tar --strip-components=1 -xzf - -C $(BIN_DIR)
+	curl -L "https://github.com/thanos-io/thanos/releases/download/v$(THANOS_VERSION)/thanos-$(THANOS_VERSION).$(OS)-$(ARCH).tar.gz" | tar --strip-components=1 -xzf - -C $(BIN_DIR)
 
 $(OBSERVATORIUM): | $(BIN_DIR)
 	go build -mod=mod -o $@ github.com/observatorium/api
@@ -123,4 +161,4 @@ $(GOLANGCILINT):
 		| sh -s -- -b $(FIRST_GOPATH)/bin $(GOLANGCILINT_VERSION)
 
 $(SHELLCHECK): | $(BIN_DIR)
-	curl -sNL "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.$(OS).$(ARCH).tar.xz" | tar --strip-components=1 -xJf - -C $(BIN_DIR)
+	curl -sNL "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.$(OS).$(shell uname -m).tar.xz" | tar --strip-components=1 -xJf - -C $(BIN_DIR)
