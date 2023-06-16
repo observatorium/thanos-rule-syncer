@@ -1,2 +1,4 @@
 /tmp/
 /thanos-rule-syncer
+vendor/
+.buildxcache

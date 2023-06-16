@@ -1,11 +1,14 @@
-FROM golang:1.16-alpine3.14 as builder
+FROM --platform=$BUILDPLATFORM golang:1.16-alpine3.14 as builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apk add --update --no-cache ca-certificates tzdata git make bash && update-ca-certificates
 
 ADD . /opt
 WORKDIR /opt
 
-RUN git update-index --refresh; make build
+RUN git update-index --refresh; make build OS=${TARGETOS} ARCH=${TARGETARCH}
 
 FROM alpine:3.14 as runner
 
