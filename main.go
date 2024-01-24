@@ -91,6 +91,13 @@ func main() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 
+	// add metrics for total duration of tenants file reload
+	reloadDuration := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "thanos_rule_syncer_reload_duration_seconds",
+		Help: "Total duration of tenants file reload.",
+	})
+	registry.MustRegister(reloadDuration)
+
 	roundTripperInst := newRoundTripperInstrumenter(registry)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -216,13 +223,19 @@ func main() {
 		if err := fn(ctx); err != nil {
 			log.Print(err.Error())
 		}
+
 		ticker := time.NewTicker(time.Duration(cfg.interval) * time.Second)
 		for {
 			select {
 			case <-ticker.C:
+				startTime := time.Now()
+				ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				if err := fn(ctx); err != nil {
 					log.Print(err.Error())
+				} else {
+					reloadDuration.Set(time.Since(startTime).Seconds())
 				}
+				cancel()
 			case <-ctx.Done():
 				return nil
 			}
