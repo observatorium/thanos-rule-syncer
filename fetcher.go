@@ -1,18 +1,142 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
+	"sync"
 
 	rulesspec "github.com/observatorium/api/rules"
+	"github.com/prometheus/prometheus/model/rulefmt"
+	"gopkg.in/yaml.v3"
 )
 
-type fetcher interface {
-	getRules(ctx context.Context) (rules io.ReadCloser, err error)
+// RulesObjtoreFetcher fetches rules for all configured tenants from the rules-objstore.
+type RulesObjtoreFetcher struct {
+	client  rulesspec.ClientInterface
+	tenants []string
+}
+
+func NewRulesObjtoreFetcher(baseURL string, tenants []string, client *http.Client) (*RulesObjtoreFetcher, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	baseURLParsed, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse RulesObjtoreFetcher URL: %w", err)
+	}
+
+	rulesClient, err := rulesspec.NewClient(baseURLParsed.String(), rulesspec.WithHTTPClient(client))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create rules-objstore client: %w", err)
+	}
+
+	return &RulesObjtoreFetcher{
+		client:  rulesClient,
+		tenants: tenants,
+	}, nil
+}
+
+type tenantFetchResult struct {
+	tenant string
+	res    *http.Response
+	err    error
+}
+
+// GetTenantsRules fetches rules for all configured tenants from the rules-objstore.
+func (f *RulesObjtoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadCloser, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	concurrency := 10
+	var sem = make(chan struct{}, concurrency)
+	results := make(chan tenantFetchResult)
+
+	// Launch goroutines that fetches rules for each tenant concurrently.
+	go func() {
+		var wg sync.WaitGroup
+		defer close(results)
+		defer wg.Wait() // Wait for all goroutines to finish before closing results channel.
+
+		for _, tenantID := range f.tenants {
+			// Use semaphore to limit concurrency, and return early if context is cancelled.
+			select {
+			case <-ctx.Done():
+				results <- tenantFetchResult{tenantID, nil, ctx.Err()}
+				return
+			case sem <- struct{}{}:
+			}
+
+			// Launch goroutine to fetch rules for a tenant.
+			wg.Add(1)
+			go func(tenantID string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				res, err := f.client.ListRules(ctx, tenantID)
+				results <- tenantFetchResult{tenantID, res, err}
+			}(tenantID)
+		}
+	}()
+
+	// Consume results and return on first error.
+	// Retuning cancels the context, which in turn cancels all goroutines.
+	var rules []rulefmt.RuleGroup
+	for result := range results {
+		if result.err != nil {
+			return nil, fmt.Errorf("failed to do http request: %w", result.err)
+		}
+
+		if result.res.StatusCode/100 != 2 {
+			return nil, fmt.Errorf("got unexpected status from Observatorium API: %d", result.res.StatusCode)
+		}
+
+		// Read and parse response body
+		body, err := io.ReadAll(result.res.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response body: %w", err)
+		}
+		result.res.Body.Close()
+
+		rulesParsed, errors := rulefmt.Parse(body)
+		if len(errors) > 0 {
+			return nil, fmt.Errorf(aggregateErrorMessages(errors))
+		}
+
+		// Prepend tenant name to all rules group names to avoid conflicts
+		// This reflects the behavior of the rules-objstore api for ListAllRules.
+		for i, group := range rulesParsed.Groups {
+			rulesParsed.Groups[i].Name = result.tenant + "." + group.Name
+		}
+
+		rules = append(rules, rulesParsed.Groups...)
+	}
+
+	returnData, err := yaml.Marshal(rulefmt.RuleGroups{Groups: rules})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal rules: %w", err)
+	}
+
+	ret := io.NopCloser(bytes.NewReader(returnData))
+	return ret, nil
+}
+
+// GetAllRules fetches all rules from the rules-objstore.
+func (f *RulesObjtoreFetcher) GetAllRules(ctx context.Context) (io.ReadCloser, error) {
+	res, err := f.client.ListAllRules(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to do http request: %w", err)
+	}
+	if res.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("got unexpected status from rules backend: %d", res.StatusCode)
+	}
+
+	return res.Body, nil
 }
 
 // observatoriumAPIFetcher fetches rules for a tenant from Observatorium API.
@@ -53,30 +177,15 @@ func (f *observatoriumAPIFetcher) getRules(ctx context.Context) (io.ReadCloser, 
 	return res.Body, nil
 }
 
-// rulesBackendFetcher fetches rules for all tenants from Rules Storage Backend.
-type rulesBackendFetcher struct {
-	client rulesspec.ClientInterface
-}
+func aggregateErrorMessages(errs []error) string {
+	var builder strings.Builder
 
-func newRulesBackendFetcher(baseURL string, client *http.Client) (*rulesBackendFetcher, error) {
-	rulesClient, err := rulesspec.NewClient(baseURL, rulesspec.WithHTTPClient(client))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create rules backend client: %w", err)
+	for i, err := range errs {
+		if i > 0 {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(err.Error())
 	}
 
-	return &rulesBackendFetcher{
-		client: rulesClient,
-	}, nil
-}
-
-func (f *rulesBackendFetcher) getRules(ctx context.Context) (io.ReadCloser, error) {
-	res, err := f.client.ListAllRules(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to do http request: %w", err)
-	}
-	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("got unexpected status from rules backend: %d", res.StatusCode)
-	}
-
-	return res.Body, nil
+	return builder.String()
 }
