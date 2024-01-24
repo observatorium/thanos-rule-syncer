@@ -18,10 +18,13 @@ import (
 
 // RulesObjtoreFetcher fetches rules for all configured tenants from the rules-objstore.
 type RulesObjtoreFetcher struct {
-	client  rulesspec.ClientInterface
-	tenants []string
+	client     rulesspec.ClientInterface
+	tenants    []string
+	tenantsMtx sync.Mutex
 }
 
+// NewRulesObjtoreFetcher creates a new RulesObjtoreFetcher.
+// The tenants list must be deduplicated otherwise, rules groups will not be unique.
 func NewRulesObjtoreFetcher(baseURL string, tenants []string, client *http.Client) (*RulesObjtoreFetcher, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -58,11 +61,17 @@ func (f *RulesObjtoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadClose
 	var sem = make(chan struct{}, concurrency)
 	results := make(chan tenantFetchResult)
 
-	// Launch goroutines that fetches rules for each tenant concurrently.
+	// Launch goroutines that fetch rules for each tenant concurrently.
 	go func() {
 		var wg sync.WaitGroup
 		defer close(results)
 		defer wg.Wait() // Wait for all goroutines to finish before closing results channel.
+
+		// tenants can be changed concurrently, we copy the list to avoid locking for too long.
+		f.tenantsMtx.Lock()
+		tenants := make([]string, len(f.tenants))
+		copy(tenants, f.tenants)
+		f.tenantsMtx.Unlock()
 
 		for _, tenantID := range f.tenants {
 			// Use semaphore to limit concurrency, and return early if context is cancelled.
@@ -85,7 +94,7 @@ func (f *RulesObjtoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadClose
 	}()
 
 	// Consume results and return on first error.
-	// Retuning cancels the context, which in turn cancels all goroutines.
+	// Returning cancels the context, which in turn cancels all goroutines.
 	var rules []rulefmt.RuleGroup
 	for result := range results {
 		if result.err != nil {
@@ -137,6 +146,14 @@ func (f *RulesObjtoreFetcher) GetAllRules(ctx context.Context) (io.ReadCloser, e
 	}
 
 	return res.Body, nil
+}
+
+// SetTenants sets the tenants to fetch rules for.
+// This method is thread-safe.
+func (f *RulesObjtoreFetcher) SetTenants(tenants []string) {
+	f.tenantsMtx.Lock()
+	f.tenants = tenants
+	f.tenantsMtx.Unlock()
 }
 
 // observatoriumAPIFetcher fetches rules for a tenant from Observatorium API.
