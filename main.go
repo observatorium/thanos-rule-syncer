@@ -237,7 +237,7 @@ func main() {
 			select {
 			case <-ticker.C:
 				startTime := time.Now()
-				timeout := min(60*time.Second, time.Duration(cfg.interval)*time.Second)
+				timeout := max(60*time.Second, time.Duration(cfg.interval)*time.Second)
 				ctx, cancel := context.WithTimeout(ctx, timeout)
 				if err := fn(ctx); err != nil {
 					log.Print(err.Error())
