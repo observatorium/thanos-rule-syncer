@@ -149,6 +149,14 @@ func main() {
 		}
 	}
 
+	// Set retryable HTTP client.
+	clientFetcher.Transport = NewRetryableTransport(&RetryableTransportCfg{
+		Transport:       clientFetcher.Transport,
+		InitialInterval: 200 * time.Millisecond,
+		MaxInterval:     2 * time.Second,
+		MaxElapsedTime:  10 * time.Second,
+	})
+
 	var f fetcher
 	var gr run.Group
 	var tenset tenantsSetter
@@ -229,7 +237,8 @@ func main() {
 			select {
 			case <-ticker.C:
 				startTime := time.Now()
-				ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				timeout := min(60*time.Second, time.Duration(cfg.interval)*time.Second)
+				ctx, cancel := context.WithTimeout(ctx, timeout)
 				if err := fn(ctx); err != nil {
 					log.Print(err.Error())
 				} else {

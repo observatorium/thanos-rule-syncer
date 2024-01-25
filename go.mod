@@ -3,6 +3,7 @@ module github.com/observatorium/thanos-rule-syncer
 go 1.21
 
 require (
+	github.com/cenkalti/backoff/v4 v4.2.1
 	github.com/coreos/go-oidc v2.2.1+incompatible
 	github.com/metalmatze/signal v0.0.0-20210307161603-1c9aa721a97a
 	github.com/observatorium/api v0.1.3-0.20240116040305-162bfada296c

@@ -22,6 +22,7 @@ type tenantsReader func() ([]string, error)
 func newTenantsFileReloader(ctx context.Context, readTenants tenantsReader, interval time.Duration, tenset tenantsSetter) error {
 	var tenants []string
 	var err error
+	interval = min(interval, 1*time.Minute)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
