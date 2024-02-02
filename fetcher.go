@@ -16,8 +16,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// RulesObjtoreFetcher fetches rules for all configured tenants from the rules-objstore.
-type RulesObjtoreFetcher struct {
+// RulesObjstoreFetcher fetches rules for all configured tenants from the rules-objstore.
+type RulesObjstoreFetcher struct {
 	client     rulesspec.ClientInterface
 	tenants    []string
 	tenantsMtx sync.Mutex
@@ -25,7 +25,7 @@ type RulesObjtoreFetcher struct {
 
 // NewRulesObjtoreFetcher creates a new RulesObjtoreFetcher.
 // The tenants list must be deduplicated otherwise, rules groups will not be unique.
-func NewRulesObjtoreFetcher(baseURL string, tenants []string, client *http.Client) (*RulesObjtoreFetcher, error) {
+func NewRulesObjtoreFetcher(baseURL string, tenants []string, client *http.Client) (*RulesObjstoreFetcher, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -40,7 +40,7 @@ func NewRulesObjtoreFetcher(baseURL string, tenants []string, client *http.Clien
 		return nil, fmt.Errorf("failed to create rules-objstore client: %w", err)
 	}
 
-	return &RulesObjtoreFetcher{
+	return &RulesObjstoreFetcher{
 		client:  rulesClient,
 		tenants: tenants,
 	}, nil
@@ -53,7 +53,7 @@ type tenantFetchResult struct {
 }
 
 // GetTenantsRules fetches rules for all configured tenants from the rules-objstore.
-func (f *RulesObjtoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadCloser, error) {
+func (f *RulesObjstoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadCloser, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -136,7 +136,7 @@ func (f *RulesObjtoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadClose
 }
 
 // GetAllRules fetches all rules from the rules-objstore.
-func (f *RulesObjtoreFetcher) GetAllRules(ctx context.Context) (io.ReadCloser, error) {
+func (f *RulesObjstoreFetcher) GetAllRules(ctx context.Context) (io.ReadCloser, error) {
 	res, err := f.client.ListAllRules(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to do http request: %w", err)
@@ -150,7 +150,7 @@ func (f *RulesObjtoreFetcher) GetAllRules(ctx context.Context) (io.ReadCloser, e
 
 // SetTenants sets the tenants to fetch rules for.
 // This method is thread-safe.
-func (f *RulesObjtoreFetcher) SetTenants(tenants []string) {
+func (f *RulesObjstoreFetcher) SetTenants(tenants []string) {
 	f.tenantsMtx.Lock()
 	f.tenants = tenants
 	f.tenantsMtx.Unlock()

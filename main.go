@@ -298,7 +298,7 @@ func reloadThanosRule(ctx context.Context, client *http.Client, url string) erro
 	return nil
 }
 
-func configureRulesObjtoreFetcher(cfg *config, client *http.Client) *RulesObjtoreFetcher {
+func configureRulesObjtoreFetcher(cfg *config, client *http.Client) *RulesObjstoreFetcher {
 	if cfg.tenantsFile != "" && cfg.tenant != "" {
 		log.Fatalf("only one of -tenant and -tenants-file can be specified")
 	}
