@@ -1,13 +1,14 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io/fs"
+	"io"
 	"log"
 	"os"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type tenantsSetter interface {
@@ -62,20 +63,40 @@ func readTenantsFile(file string) ([]string, error) {
 	}
 	defer f.Close()
 
-	return scanFile(f)
+	fileData, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tenants file: %w", err)
+	}
+
+	return scanFile(fileData)
 }
 
-// scanFile scans a file and returns a slice of tenants.
-// It expects one tenant per line and ignores empty lines.
-// Returned tenants are deduplicated.
-func scanFile(f fs.File) ([]string, error) {
-	var tenants []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		tenants = append(tenants, scanner.Text())
+type TenantsConfig struct {
+	Tenants []TenantConfig `yaml:"tenants"`
+}
+
+type TenantConfig struct {
+	Name string `yaml:"name"`
+}
+
+func scanFile(f []byte) ([]string, error) {
+	if len(f) == 0 {
+		return nil, fmt.Errorf("no tenants found in file")
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read tenants file: %w", err)
+
+	tenantsCfg := &TenantsConfig{}
+	err := yaml.Unmarshal(f, tenantsCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tenants file: %w", err)
+	}
+
+	tenants := make([]string, 0, len(tenantsCfg.Tenants))
+	for _, tenant := range tenantsCfg.Tenants {
+		tenants = append(tenants, tenant.Name)
+	}
+
+	if len(tenants) == 0 {
+		return nil, fmt.Errorf("no tenants found in file")
 	}
 
 	// Deduplicate tenants, remove empty lines
@@ -96,14 +117,10 @@ func scanFile(f fs.File) ([]string, error) {
 		log.Printf("WARNING: found duplicate tenants in file: %v", duplicates)
 	}
 
-	ret := make([]string, 0, len(tenantsSet))
+	tenants = tenants[:0]
 	for tenant := range tenantsSet {
-		ret = append(ret, tenant)
+		tenants = append(tenants, tenant)
 	}
 
-	if len(ret) == 0 {
-		return nil, fmt.Errorf("no tenants found in file")
-	}
-
-	return ret, nil
+	return tenants, nil
 }

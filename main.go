@@ -91,7 +91,6 @@ func main() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
 
-	// add metrics for total duration of tenants file reload
 	reloadDuration := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "thanos_rule_syncer_reload_duration_seconds",
 		Help: "Total duration of tenants file reload.",
@@ -157,34 +156,33 @@ func main() {
 		MaxElapsedTime:  10 * time.Second,
 	})
 
-	var f fetcher
+	var rulesFetcher fetcher
 	var gr run.Group
-	var tenset tenantsSetter
+	var tenantsUpdater tenantsSetter
 
 	// If rulesBackendURL is specified, use it to fetch rules in priority.
 	// Otherwise, use observatoriumURL to fetch rules.
 	if cfg.rulesBackendURL != "" {
 		rof := configureRulesObjtoreFetcher(cfg, clientFetcher)
-		tenset = rof
+		tenantsUpdater = rof
 
 		// If at least one tenant is specified, use GetTenantsRules to fetch rules for each tenant.
 		// Otherwise, use GetAllRules to fetch rules for all tenants.
+		rulesFetcher = fetcherFunc(rof.GetAllRules)
 		if len(cfg.tenant) > 0 {
-			f = fetcherFunc(rof.GetTenantsRules)
-		} else {
-			f = fetcherFunc(rof.GetAllRules)
+			rulesFetcher = fetcherFunc(rof.GetTenantsRules)
 		}
 	} else if cfg.observatoriumURL != "" {
 		if cfg.tenantsFile != "" || cfg.tenant == "" {
 			log.Fatal("a tenant must be specified with the -tenant flag when using the Observatorium API")
 		}
 
-		fetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, clientFetcher)
+		obsAPIFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, clientFetcher)
 		if err != nil {
 			log.Fatalf("failed to initialize Observatorium API fetcher: %v", err)
 		}
 
-		f = fetcher
+		rulesFetcher = obsAPIFetcher
 	} else {
 		log.Fatal("either -rules-backend-url or -observatorium-api-url must be specified")
 	}
@@ -197,7 +195,7 @@ func main() {
 		interval := time.Duration(cfg.interval) * time.Second
 
 		gr.Add(func() error {
-			return newTenantsFileReloader(ctx, tenantsReader, interval, tenset)
+			return newTenantsFileReloader(ctx, tenantsReader, interval, tenantsUpdater)
 		}, func(_ error) {
 			cancel()
 		})
@@ -207,7 +205,7 @@ func main() {
 
 	gr.Add(func() error {
 		fn := func(ctx context.Context) error {
-			rules, err := f.getRules(ctx)
+			rules, err := rulesFetcher.getRules(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to get rules from url: %v", err)
 			}

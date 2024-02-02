@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -21,34 +20,22 @@ func TestScanFile(t *testing.T) {
 			expectErr:   true,
 		},
 		"single tenant": {
-			fileContent: "tenant1",
+			fileContent: "tenants:\n- name: tenant1",
 			expect:      []string{"tenant1"},
 		},
 		"multiple tenants": {
-			fileContent: "tenant1\ntenant2",
-			expect:      []string{"tenant1", "tenant2"},
-		},
-		"multiple tenants with empty lines": {
-			fileContent: "tenant1\n\ntenant2\n\n\n",
+			fileContent: "tenants:\n- name: tenant1\n- name: tenant2",
 			expect:      []string{"tenant1", "tenant2"},
 		},
 		"multiple tenants with duplicates": {
-			fileContent: "tenant1\ntenant2\ntenant1",
+			fileContent: "tenants:\n- name: tenant1\n- name: tenant1\n- name: tenant2",
 			expect:      []string{"tenant1", "tenant2"},
 		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			fs := fstest.MapFS{
-				"tenants.txt": &fstest.MapFile{
-					Data: []byte(tc.fileContent),
-				},
-			}
-			ss, err := fs.Open("tenants.txt")
-			assert.NoError(t, err)
-
-			tenants, err := scanFile(ss)
+			tenants, err := scanFile([]byte(tc.fileContent))
 			if tc.expectErr {
 				assert.Error(t, err)
 				return

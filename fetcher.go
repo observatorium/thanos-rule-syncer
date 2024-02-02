@@ -64,8 +64,10 @@ func (f *RulesObjstoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadClos
 	// Launch goroutines that fetch rules for each tenant concurrently.
 	go func() {
 		var wg sync.WaitGroup
-		defer close(results)
-		defer wg.Wait() // Wait for all goroutines to finish before closing results channel.
+		defer func() {
+			wg.Wait() // Wait for all goroutines to finish before closing results channel.
+			close(results)
+		}()
 
 		// tenants can be changed concurrently, we copy the list to avoid locking for too long.
 		f.tenantsMtx.Lock()
@@ -85,8 +87,10 @@ func (f *RulesObjstoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadClos
 			// Launch goroutine to fetch rules for a tenant.
 			wg.Add(1)
 			go func(tenantID string) {
-				defer wg.Done()
-				defer func() { <-sem }()
+				defer func() {
+					wg.Done()
+					<-sem
+				}()
 				res, err := f.client.ListRules(ctx, tenantID)
 				results <- tenantFetchResult{tenantID, res, err}
 			}(tenantID)
@@ -107,10 +111,10 @@ func (f *RulesObjstoreFetcher) GetTenantsRules(ctx context.Context) (io.ReadClos
 
 		// Read and parse response body
 		body, err := io.ReadAll(result.res.Body)
+		result.res.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response body: %w", err)
 		}
-		result.res.Body.Close()
 
 		rulesParsed, errors := rulefmt.Parse(body)
 		if len(errors) > 0 {
