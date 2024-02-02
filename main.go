@@ -315,7 +315,7 @@ func configureRulesObjtoreFetcher(cfg *config, client *http.Client) *RulesObjsto
 		tenants = []string{cfg.tenant}
 	}
 
-	rof, err := NewRulesObjtoreFetcher(cfg.rulesBackendURL, tenants, client)
+	rof, err := NewRulesObjstoreFetcher(cfg.rulesBackendURL, tenants, client)
 	if err != nil {
 		log.Fatalf("failed to initialize Rules Object Store fetcher: %v", err)
 	}

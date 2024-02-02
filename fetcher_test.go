@@ -83,7 +83,7 @@ func TestRulesObjtoreFetcher(t *testing.T) {
 			testServer := httptest.NewServer(http.HandlerFunc(handler))
 			defer testServer.Close()
 
-			fetcher, err := trs.NewRulesObjtoreFetcher(testServer.URL, tc.tenants, testServer.Client())
+			fetcher, err := trs.NewRulesObjstoreFetcher(testServer.URL, tc.tenants, testServer.Client())
 			assert.NoError(t, err)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)

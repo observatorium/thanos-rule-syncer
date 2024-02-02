@@ -23,9 +23,9 @@ type RulesObjstoreFetcher struct {
 	tenantsMtx sync.Mutex
 }
 
-// NewRulesObjtoreFetcher creates a new RulesObjtoreFetcher.
+// NewRulesObjstoreFetcher creates a new RulesObjtoreFetcher.
 // The tenants list must be deduplicated otherwise, rules groups will not be unique.
-func NewRulesObjtoreFetcher(baseURL string, tenants []string, client *http.Client) (*RulesObjstoreFetcher, error) {
+func NewRulesObjstoreFetcher(baseURL string, tenants []string, client *http.Client) (*RulesObjstoreFetcher, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
