@@ -68,7 +68,7 @@ func readTenantsFile(file string) ([]string, error) {
 		return nil, fmt.Errorf("failed to read tenants file: %w", err)
 	}
 
-	return scanFile(fileData)
+	return readTenantsConfig(fileData)
 }
 
 type TenantsConfig struct {
@@ -76,10 +76,10 @@ type TenantsConfig struct {
 }
 
 type TenantConfig struct {
-	Name string `yaml:"name"`
+	ID string `yaml:"name"`
 }
 
-func scanFile(f []byte) ([]string, error) {
+func readTenantsConfig(f []byte) ([]string, error) {
 	if len(f) == 0 {
 		return nil, fmt.Errorf("no tenants found in file")
 	}
@@ -92,14 +92,14 @@ func scanFile(f []byte) ([]string, error) {
 
 	tenants := make([]string, 0, len(tenantsCfg.Tenants))
 	for _, tenant := range tenantsCfg.Tenants {
-		tenants = append(tenants, tenant.Name)
+		tenants = append(tenants, tenant.ID)
 	}
 
 	if len(tenants) == 0 {
 		return nil, fmt.Errorf("no tenants found in file")
 	}
 
-	// Deduplicate tenants, remove empty lines
+	// check for duplicates
 	tenantsSet := make(map[string]struct{}, len(tenants))
 	duplicates := []string{}
 	for _, tenant := range tenants {
@@ -114,12 +114,7 @@ func scanFile(f []byte) ([]string, error) {
 	}
 
 	if len(duplicates) > 0 {
-		log.Printf("WARNING: found duplicate tenants in file: %v", duplicates)
-	}
-
-	tenants = tenants[:0]
-	for tenant := range tenantsSet {
-		tenants = append(tenants, tenant)
+		return nil, fmt.Errorf("found duplicate tenants in file: %v", duplicates)
 	}
 
 	return tenants, nil

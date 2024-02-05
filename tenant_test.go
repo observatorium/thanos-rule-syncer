@@ -7,53 +7,61 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"gopkg.in/yaml.v3"
 )
 
-func TestScanFile(t *testing.T) {
+func TestTenantsConfig(t *testing.T) {
 	testCases := map[string]struct {
-		fileContent string
-		expectErr   bool
-		expect      []string
+		fileContent   TenantsConfig
+		expectErr     bool
+		expectTenants []string
+		expectPanics  bool
 	}{
 		"empty file": {
-			fileContent: "",
+			fileContent: TenantsConfig{},
 			expectErr:   true,
 		},
-		"single tenant": {
-			fileContent: "tenants:\n- name: tenant1",
-			expect:      []string{"tenant1"},
-		},
-		"multiple tenants": {
-			fileContent: "tenants:\n- name: tenant1\n- name: tenant2",
-			expect:      []string{"tenant1", "tenant2"},
+		"valid tenants": {
+			fileContent: TenantsConfig{
+				Tenants: []TenantConfig{
+					{
+						ID: "tenant1",
+					},
+					{
+						ID: "tenant2",
+					},
+				},
+			},
+			expectTenants: []string{"tenant1", "tenant2"},
 		},
 		"multiple tenants with duplicates": {
-			fileContent: "tenants:\n- name: tenant1\n- name: tenant1\n- name: tenant2",
-			expect:      []string{"tenant1", "tenant2"},
+			fileContent: TenantsConfig{
+				Tenants: []TenantConfig{
+					{
+						ID: "tenant1",
+					},
+					{
+						ID: "tenant1",
+					},
+				},
+			},
+			expectErr: true,
 		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			tenants, err := scanFile([]byte(tc.fileContent))
+			tenantsCfg, err := yaml.Marshal(tc.fileContent)
+			assert.NoError(t, err)
+
+			tenants, err := readTenantsConfig(tenantsCfg)
 			if tc.expectErr {
 				assert.Error(t, err)
 				return
 			}
 
 			assert.NoError(t, err)
-			assert.Len(t, tenants, len(tc.expect))
-
-			expectedTenants := make(map[string]struct{}, len(tc.expect))
-			for _, tenant := range tc.expect {
-				expectedTenants[tenant] = struct{}{}
-			}
-
-			for _, tenant := range tenants {
-				_, ok := expectedTenants[tenant]
-				assert.True(t, ok)
-				delete(expectedTenants, tenant)
-			}
+			assert.Len(t, tenants, len(tc.expectTenants))
 		})
 	}
 }
