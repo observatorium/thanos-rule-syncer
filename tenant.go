@@ -76,7 +76,7 @@ type TenantsConfig struct {
 }
 
 type TenantConfig struct {
-	ID string `yaml:"name"`
+	ID string `yaml:"id"`
 }
 
 func readTenantsConfig(f []byte) ([]string, error) {
