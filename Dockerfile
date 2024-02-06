@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.16-alpine3.14 as builder
+FROM --platform=$BUILDPLATFORM golang:1.21-alpine3.19 as builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -10,7 +10,7 @@ WORKDIR /opt
 
 RUN git update-index --refresh; make build OS=${TARGETOS} ARCH=${TARGETARCH}
 
-FROM alpine:3.14 as runner
+FROM alpine:3.19 as runner
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /opt/thanos-rule-syncer /bin/thanos-rule-syncer

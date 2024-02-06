@@ -35,6 +35,8 @@ Usage of ./thanos-rule-syncer:
     	The URL of the Rules Storage Backend from which to fetch the rules. If specified, it gets priority over -observatorium-api-url and auth flags are no longer needed.
   -tenant string
     	The name of the tenant whose rules should be synced.
+  -tenants-file string
+    	The path to a file containing the list of tenants whose rules should be synced. There must be one tenant per line.
   -thanos-rule-url string
     	The URL of Thanos Ruler that is used to trigger reloads of rules. We will append /-/reload. Required.
   -web.internal.listen string

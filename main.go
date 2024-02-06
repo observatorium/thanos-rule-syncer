@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -29,6 +30,7 @@ type config struct {
 	thanosRuleURL    string
 	file             string
 	tenant           string
+	tenantsFile      string
 	oidc             oidcConfig
 	interval         uint
 
@@ -40,6 +42,16 @@ type oidcConfig struct {
 	clientID     string
 	clientSecret string
 	issuerURL    string
+}
+
+type fetcher interface {
+	getRules(ctx context.Context) (rules io.ReadCloser, err error)
+}
+
+type fetcherFunc func(ctx context.Context) (rules io.ReadCloser, err error)
+
+func (f fetcherFunc) getRules(ctx context.Context) (rules io.ReadCloser, err error) {
+	return f(ctx)
 }
 
 func parseFlags() *config {
@@ -56,6 +68,7 @@ func parseFlags() *config {
 	// Use Observatorium API, which requires auth and needs a thanos-rule-syncer sidecar per tenant.
 	flag.StringVar(&cfg.observatoriumURL, "observatorium-api-url", "", "The URL of the Observatorium API from which to fetch the rules. If specified, auth flags must also be provided.")
 	flag.StringVar(&cfg.tenant, "tenant", "", "The name of the tenant whose rules should be synced.")
+	flag.StringVar(&cfg.tenantsFile, "tenants-file", "", "The path to a file containing the list of tenants whose rules should be synced. There must be one tenant per line.")
 	flag.StringVar(&cfg.observatoriumCA, "observatorium-ca", "", "Path to a file containing the TLS CA against which to verify the Observatorium API. If no server CA is specified, the client will use the system certificates.")
 	flag.StringVar(&cfg.oidc.issuerURL, "oidc.issuer-url", "", "The OIDC issuer URL, see https://openid.net/specs/openid-connect-discovery-1_0.html#IssuerDiscovery.")
 	flag.StringVar(&cfg.oidc.clientSecret, "oidc.client-secret", "", "The OIDC client secret, see https://tools.ietf.org/html/rfc6749#section-2.3.")
@@ -77,6 +90,12 @@ func main() {
 		//nolint:exhaustivestruct
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
+
+	reloadDuration := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "thanos_rule_syncer_reload_duration_seconds",
+		Help: "Total duration of tenants file reload.",
+	})
+	registry.MustRegister(reloadDuration)
 
 	roundTripperInst := newRoundTripperInstrumenter(registry)
 
@@ -129,28 +148,64 @@ func main() {
 		}
 	}
 
-	var f fetcher
+	// Set retryable HTTP client.
+	clientFetcher.Transport = NewRetryableTransport(&RetryableTransportCfg{
+		Transport:       clientFetcher.Transport,
+		InitialInterval: 200 * time.Millisecond,
+		MaxInterval:     2 * time.Second,
+		MaxElapsedTime:  10 * time.Second,
+	})
 
+	var rulesFetcher fetcher
+	var gr run.Group
+	var tenantsUpdater tenantsSetter
+
+	// If rulesBackendURL is specified, use it to fetch rules in priority.
+	// Otherwise, use observatoriumURL to fetch rules.
 	if cfg.rulesBackendURL != "" {
-		rulesFetcher, err := newRulesBackendFetcher(cfg.rulesBackendURL, clientFetcher)
-		if err != nil {
-			log.Fatalf("failed to initialize Rules Backend fetcher: %v", err)
+		rof := configureRulesObjtoreFetcher(cfg, clientFetcher)
+		tenantsUpdater = rof
+
+		// If at least one tenant is specified, use GetTenantsRules to fetch rules for each tenant.
+		// Otherwise, use GetAllRules to fetch rules for all tenants.
+		rulesFetcher = fetcherFunc(rof.GetAllRules)
+		if len(cfg.tenant) > 0 {
+			rulesFetcher = fetcherFunc(rof.GetTenantsRules)
 		}
-		f = rulesFetcher
-	} else {
-		obsFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, clientFetcher)
+	} else if cfg.observatoriumURL != "" {
+		if cfg.tenantsFile != "" || cfg.tenant == "" {
+			log.Fatal("a tenant must be specified with the -tenant flag when using the Observatorium API")
+		}
+
+		obsAPIFetcher, err := newObservatoriumAPIFetcher(cfg.observatoriumURL, cfg.tenant, clientFetcher)
 		if err != nil {
 			log.Fatalf("failed to initialize Observatorium API fetcher: %v", err)
 		}
-		f = obsFetcher
+
+		rulesFetcher = obsAPIFetcher
+	} else {
+		log.Fatal("either -rules-backend-url or -observatorium-api-url must be specified")
 	}
 
-	var gr run.Group
+	// If tenantsFile is specified, reload the list of tenants at the same rate as the rules.
+	if cfg.tenantsFile != "" {
+		tenantsReader := func() ([]string, error) {
+			return readTenantsFile(cfg.tenantsFile)
+		}
+		interval := time.Duration(cfg.interval) * time.Second
+
+		gr.Add(func() error {
+			return newTenantsFileReloader(ctx, tenantsReader, interval, tenantsUpdater)
+		}, func(_ error) {
+			cancel()
+		})
+	}
+
 	gr.Add(run.SignalHandler(ctx, os.Interrupt))
 
 	gr.Add(func() error {
 		fn := func(ctx context.Context) error {
-			rules, err := f.getRules(ctx)
+			rules, err := rulesFetcher.getRules(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to get rules from url: %v", err)
 			}
@@ -174,13 +229,20 @@ func main() {
 		if err := fn(ctx); err != nil {
 			log.Print(err.Error())
 		}
+
 		ticker := time.NewTicker(time.Duration(cfg.interval) * time.Second)
 		for {
 			select {
 			case <-ticker.C:
+				startTime := time.Now()
+				timeout := max(60*time.Second, time.Duration(cfg.interval)*time.Second)
+				ctx, cancel := context.WithTimeout(ctx, timeout)
 				if err := fn(ctx); err != nil {
 					log.Print(err.Error())
+				} else {
+					reloadDuration.Set(time.Since(startTime).Seconds())
 				}
+				cancel()
 			case <-ctx.Done():
 				return nil
 			}
@@ -232,4 +294,29 @@ func reloadThanosRule(ctx context.Context, client *http.Client, url string) erro
 	}
 
 	return nil
+}
+
+func configureRulesObjtoreFetcher(cfg *config, client *http.Client) *RulesObjstoreFetcher {
+	if cfg.tenantsFile != "" && cfg.tenant != "" {
+		log.Fatalf("only one of -tenant and -tenants-file can be specified")
+	}
+
+	// Set initial tenants list
+	var tenants []string
+	if cfg.tenantsFile != "" {
+		var err error
+		tenants, err = readTenantsFile(cfg.tenantsFile)
+		if err != nil {
+			log.Fatalf("failed to read tenants file: %v", err)
+		}
+	} else if cfg.tenant != "" {
+		tenants = []string{cfg.tenant}
+	}
+
+	rof, err := NewRulesObjstoreFetcher(cfg.rulesBackendURL, tenants, client)
+	if err != nil {
+		log.Fatalf("failed to initialize Rules Object Store fetcher: %v", err)
+	}
+
+	return rof
 }
